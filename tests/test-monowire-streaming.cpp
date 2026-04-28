@@ -8,19 +8,20 @@
 #include <utility>
 #include <vector>
 
-#define REQUIRE(expr) do { \
-    if (!(expr)) { \
-        std::fprintf(stderr, "REQUIRE failed: %s at %s:%d\n", #expr, __FILE__, __LINE__); \
-        return 1; \
-    } \
-} while (0)
+#define REQUIRE(expr)                                                                                                  \
+    do {                                                                                                               \
+        if (!(expr)) {                                                                                                 \
+            std::fprintf(stderr, "REQUIRE failed: %s at %s:%d\n", #expr, __FILE__, __LINE__);                          \
+            return 1;                                                                                                  \
+        }                                                                                                              \
+    } while (0)
 
-static bool has_group(const monowire_streaming_plan & plan, const std::string & name) {
+static bool has_group(const monowire_streaming_plan &plan, const std::string &name) {
     return std::find(plan.selected_groups.begin(), plan.selected_groups.end(), name) != plan.selected_groups.end();
 }
 
-static ggml_tensor * make_layer_boundary(ggml_context * ctx, int layer) {
-    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+static ggml_tensor *make_layer_boundary(ggml_context *ctx, int layer) {
+    ggml_tensor *t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     const std::string name = "l_out-" + std::to_string(layer);
     ggml_set_name(t, name.c_str());
     return t;
@@ -28,14 +29,10 @@ static ggml_tensor * make_layer_boundary(ggml_context * ctx, int layer) {
 
 int main() {
     const std::vector<monowire_streaming_tensor> tensors = {
-        {0, 0,   0, 150, "blk.0.ffn_down.weight"},
-        {1, 0, 150, 150, "blk.1.ffn_down.weight"},
-        {0, 0, 300, 130, "blk.0.ffn_up.weight"},
-        {1, 0, 430, 130, "blk.1.ffn_up.weight"},
-        {0, 0, 560,  40, "blk.0.attn_k.weight"},
-        {1, 0, 600,  40, "blk.1.attn_k.weight"},
-        {0, 0, 640,  60, "blk.0.attn_q.weight"},
-        {1, 0, 700,  60, "blk.1.attn_q.weight"},
+        {0, 0, 0, 150, "blk.0.ffn_down.weight"}, {1, 0, 150, 150, "blk.1.ffn_down.weight"},
+        {0, 0, 300, 130, "blk.0.ffn_up.weight"}, {1, 0, 430, 130, "blk.1.ffn_up.weight"},
+        {0, 0, 560, 40, "blk.0.attn_k.weight"},  {1, 0, 600, 40, "blk.1.attn_k.weight"},
+        {0, 0, 640, 60, "blk.0.attn_q.weight"},  {1, 0, 700, 60, "blk.1.attn_q.weight"},
     };
 
     {
@@ -87,7 +84,7 @@ int main() {
         REQUIRE(runtime.dynamic_ranges_by_layer[0].size() == 1);
         REQUIRE(runtime.dynamic_ranges_by_layer[1].size() == 1);
         REQUIRE(runtime.dynamic_ranges_by_layer[0][0].first == 640);
-        REQUIRE(runtime.dynamic_ranges_by_layer[0][0].last  == 700);
+        REQUIRE(runtime.dynamic_ranges_by_layer[0][0].last == 700);
     }
 
     {
@@ -111,28 +108,38 @@ int main() {
         state.begin_graph();
 
         ggml_init_params params = {
-            /*.mem_size   =*/ 16 * 1024,
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ false,
+            /*.mem_size   =*/16 * 1024,
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/false,
         };
-        ggml_context * ctx = ggml_init(params);
+        ggml_context *ctx = ggml_init(params);
         REQUIRE(ctx != nullptr);
 
-        ggml_tensor * l0 = make_layer_boundary(ctx, 0);
-        ggml_tensor * l1 = make_layer_boundary(ctx, 1);
-        ggml_tensor * l2 = make_layer_boundary(ctx, 2);
-        ggml_tensor * l3 = make_layer_boundary(ctx, 3);
-        ggml_tensor * l4 = make_layer_boundary(ctx, 4);
-        ggml_tensor * l5 = make_layer_boundary(ctx, 5);
+        ggml_tensor *l0 = make_layer_boundary(ctx, 0);
+        ggml_tensor *l1 = make_layer_boundary(ctx, 1);
+        ggml_tensor *l2 = make_layer_boundary(ctx, 2);
+        ggml_tensor *l3 = make_layer_boundary(ctx, 3);
+        ggml_tensor *l4 = make_layer_boundary(ctx, 4);
+        ggml_tensor *l5 = make_layer_boundary(ctx, 5);
 
-        REQUIRE(!state.on_eval(l0, true));
-        REQUIRE(!state.on_eval(l1, true));
+        REQUIRE(state.on_eval(l0, true));
+        REQUIRE(state.on_eval(l1, true));
         REQUIRE(state.on_eval(l2, true));
-        REQUIRE(!state.on_eval(l3, true));
-        REQUIRE(!state.on_eval(l4, true));
+        REQUIRE(state.on_eval(l3, true));
+        REQUIRE(state.on_eval(l4, true));
         REQUIRE(state.on_eval(l5, true));
+        REQUIRE(state.on_eval(l0, false));
+        REQUIRE(state.on_eval(l1, false));
         REQUIRE(state.on_eval(l2, false));
+        REQUIRE(state.on_eval(l3, false));
+        REQUIRE(state.on_eval(l4, false));
         REQUIRE(state.on_eval(l5, false));
+
+        const auto stats = state.stats();
+        REQUIRE(stats.graph_begins == 1);
+        REQUIRE(stats.boundary_callbacks == 6);
+        REQUIRE(stats.prefetched_ranges == 0);
+        REQUIRE(stats.evicted_ranges == 0);
 
         ggml_free(ctx);
     }

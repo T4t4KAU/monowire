@@ -1,5 +1,7 @@
 monowire_add_compile_flags()
 
+find_package(Threads REQUIRED)
+
 #
 # libraries
 #
@@ -53,7 +55,7 @@ target_include_directories(monowire PRIVATE .)
 target_include_directories(monowire PUBLIC ../include)
 target_compile_features   (monowire PRIVATE cxx_std_17) # don't bump
 
-target_link_libraries(monowire PUBLIC ggml)
+target_link_libraries(monowire PUBLIC ggml Threads::Threads)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(monowire PROPERTIES POSITION_INDEPENDENT_CODE ON)

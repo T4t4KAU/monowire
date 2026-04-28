@@ -898,6 +898,7 @@ static std::vector<monowire_streaming_tensor> monowire_model_collect_streaming_r
             /*.offset  =*/weight.offs,
             /*.size    =*/size,
             /*.name    =*/name,
+            /*.tensor  =*/tensor,
         });
     }
 
@@ -9284,9 +9285,12 @@ bool monowire_model::load_tensors(monowire_model_loader &ml) {
 
         if (runtime_plan.first_layer >= 0 && runtime_plan.dynamic_bytes > 0) {
             MONOWIRE_LOG_INFO("%s: memory streaming %.2f MiB across layers [%d, %d] "
-                              "with window %zu\n",
+                              "with window %zu, %u I/O workers and %s prefetch\n",
                               __func__, runtime_plan.dynamic_bytes / 1024.0 / 1024.0, runtime_plan.first_layer,
-                              runtime_plan.last_layer, runtime_plan.prefetch_window);
+                              runtime_plan.last_layer, runtime_plan.prefetch_window, params.streaming_io_threads,
+                              params.streaming_direct_buffer   ? "direct-buffer"
+                              : params.streaming_read_prefetch ? "read"
+                                                               : "hint");
             pimpl->streaming_runtime_plan = std::make_unique<monowire_streaming_runtime_plan>(std::move(runtime_plan));
         }
     }
@@ -10154,8 +10158,9 @@ std::unique_ptr<monowire_streaming_runtime_state> monowire_model::create_streami
         return nullptr;
     }
 
-    return std::make_unique<monowire_streaming_runtime_state>(*pimpl->streaming_runtime_plan, pimpl->mappings,
-                                                              params.streaming_evict);
+    return std::make_unique<monowire_streaming_runtime_state>(
+        *pimpl->streaming_runtime_plan, pimpl->mappings, params.streaming_evict, params.streaming_io_threads,
+        params.streaming_read_prefetch, params.streaming_direct_buffer);
 }
 
 //
@@ -10175,12 +10180,15 @@ monowire_model_params monowire_model_default_params() {
         /*.kv_overrides                =*/nullptr,
         /*.streaming_budget_bytes      =*/0,
         /*.streaming_window            =*/3,
+        /*.streaming_io_threads        =*/1,
         /*.vocab_only                  =*/false,
         /*.use_mmap                    =*/true,
         /*.use_direct_io               =*/false,
         /*.use_mlock                   =*/false,
         /*.streaming_prefetch          =*/true,
         /*.streaming_evict             =*/true,
+        /*.streaming_read_prefetch     =*/false,
+        /*.streaming_direct_buffer     =*/false,
         /*.check_tensors               =*/false,
         /*.use_extra_bufts             =*/true,
         /*.no_host                     =*/false,

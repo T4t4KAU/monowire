@@ -18,6 +18,9 @@
 #if defined(_POSIX_MAPPED_FILES)
 #include <sys/mman.h>
 #endif
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #if defined(_POSIX_MEMLOCK_RANGE)
 #include <sys/resource.h>
 #endif
@@ -433,7 +436,10 @@ struct monowire_mmap::impl {
 
     impl(struct monowire_file *file, size_t prefetch, bool numa) {
         size = file->size();
-        fd = file->file_id();
+        fd = dup(file->file_id());
+        if (fd == -1) {
+            throw std::runtime_error(format("dup failed: %s", strerror(errno)));
+        }
         int flags = MAP_SHARED;
         if (numa) {
             prefetch = 0;
@@ -486,9 +492,120 @@ struct monowire_mmap::impl {
             return;
         }
 
+#ifdef __linux__
+        // Runtime streaming knows the exact file offsets for upcoming layer
+        // weights. fadvise gives the kernel a file-level readahead hint before
+        // the mmap pages are touched by compute threads.
+        const int fadvise_ret = fd >= 0 ? posix_fadvise(fd, first, len, POSIX_FADV_WILLNEED) : 0;
+        if (fadvise_ret != 0) {
+            MONOWIRE_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_WILLNEED) failed: %s\n", strerror(fadvise_ret));
+        }
+#ifdef SYS_readahead
+        // Make the runtime prefetch worker actively submit page-cache reads.
+        // This is still mmap-backed, but it is closer to FlexInfer's explicit
+        // asynchronous I/O pipeline than relying on future page faults.
+        if (fd >= 0 && syscall(SYS_readahead, fd, (off_t)first, len) == -1) {
+            MONOWIRE_LOG_WARN("warning: readahead(..) failed: %s\n", strerror(errno));
+        }
+#endif
+#endif
         if (posix_madvise((uint8_t *)addr + first, len, POSIX_MADV_WILLNEED)) {
             MONOWIRE_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
         }
+    }
+
+    void read_fragment(size_t first, size_t last) {
+        advise_fragment(first, last);
+
+        if (fd < 0) {
+            return;
+        }
+
+        int page_size = sysconf(_SC_PAGESIZE);
+        align_range(&first, &last, page_size);
+        last = std::min(last, size);
+        if (last <= first) {
+            return;
+        }
+        size_t len = last - first;
+
+        if (len == 0) {
+            return;
+        }
+
+        // Pull pages into the filesystem cache from the background streaming
+        // worker. This is a bridge toward FlexInfer's explicit I/O pipeline:
+        // compute still uses mmap-backed tensors, but page faults should find
+        // most upcoming weights already resident.
+        static constexpr size_t read_chunk = 16 * 1024 * 1024;
+        thread_local std::vector<uint8_t> buffer;
+        const size_t buffer_size = std::min(read_chunk, len);
+        if (buffer.size() < buffer_size) {
+            buffer.resize(buffer_size);
+        }
+
+        size_t offset = first;
+        while (offset < last) {
+            const size_t to_read = std::min(buffer.size(), last - offset);
+            size_t bytes_read = 0;
+            while (bytes_read < to_read) {
+                const ssize_t ret
+                    = pread(fd, buffer.data() + bytes_read, to_read - bytes_read, (off_t)(offset + bytes_read));
+                if (ret == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    MONOWIRE_LOG_WARN("warning: pread(..) streaming prefetch failed: %s\n", strerror(errno));
+                    return;
+                }
+                if (ret == 0) {
+                    return;
+                }
+                bytes_read += (size_t)ret;
+            }
+            offset += to_read;
+        }
+    }
+
+    bool read_to(size_t offset, void *dst, size_t bytes) {
+        if (bytes == 0) {
+            return true;
+        }
+        if (dst == nullptr || offset >= size || bytes > size - offset || fd < 0) {
+            MONOWIRE_LOG_WARN(
+                "warning: streaming direct buffer read rejected: dst=%p offset=%zu bytes=%zu map_size=%zu fd=%d\n", dst,
+                offset, bytes, size, fd);
+            return false;
+        }
+
+        size_t bytes_read = 0;
+        while (bytes_read < bytes) {
+            const ssize_t ret
+                = pread(fd, (uint8_t *)dst + bytes_read, bytes - bytes_read, (off_t)(offset + bytes_read));
+            if (ret == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                MONOWIRE_LOG_WARN("warning: pread(..) streaming direct buffer failed: %s\n", strerror(errno));
+                return false;
+            }
+            if (ret == 0) {
+                return false;
+            }
+            bytes_read += (size_t)ret;
+        }
+
+#ifdef __linux__
+        // The direct-buffer path owns a private copy after this read. Drop the
+        // just-read file-cache pages so they do not compete with the streaming
+        // window in tight memory cgroups.
+        const int fadvise_ret = posix_fadvise(fd, offset, bytes, POSIX_FADV_DONTNEED);
+        if (fadvise_ret != 0) {
+            MONOWIRE_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(fadvise_ret));
+        }
+#endif
+
+        return true;
     }
 
     void evict_fragment(size_t first, size_t last) {
@@ -503,6 +620,14 @@ struct monowire_mmap::impl {
 #ifdef MADV_DONTNEED
         if (madvise((uint8_t *)addr + first, len, MADV_DONTNEED)) {
             MONOWIRE_LOG_WARN("warning: madvise(.., MADV_DONTNEED) failed: %s\n", strerror(errno));
+        }
+#endif
+#ifdef __linux__
+        // Pair mmap eviction with a file-cache hint so low-memory cgroups do
+        // not keep already-consumed dynamic weights ahead of future layers.
+        const int fadvise_ret = fd >= 0 ? posix_fadvise(fd, first, len, POSIX_FADV_DONTNEED) : 0;
+        if (fadvise_ret != 0) {
+            MONOWIRE_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(fadvise_ret));
         }
 #endif
     }
@@ -548,6 +673,9 @@ struct monowire_mmap::impl {
             if (munmap((char *)addr + frag.first, frag.second - frag.first)) {
                 MONOWIRE_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
             }
+        }
+        if (fd != -1) {
+            close(fd);
         }
     }
 #elif defined(_WIN32)
@@ -604,6 +732,19 @@ struct monowire_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void read_fragment(size_t first, size_t last) { advise_fragment(first, last); }
+
+    bool read_to(size_t offset, void *dst, size_t bytes) {
+        if (bytes == 0) {
+            return true;
+        }
+        if (dst == nullptr || offset >= size || bytes > size - offset) {
+            return false;
+        }
+        memcpy(dst, (uint8_t *)addr + offset, bytes);
+        return true;
+    }
+
     void evict_fragment(size_t first, size_t last) {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
@@ -641,6 +782,15 @@ struct monowire_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void read_fragment(size_t first, size_t last) { advise_fragment(first, last); }
+
+    bool read_to(size_t offset, void *dst, size_t bytes) {
+        GGML_UNUSED(offset);
+        GGML_UNUSED(dst);
+        GGML_UNUSED(bytes);
+        return false;
+    }
+
     void evict_fragment(size_t first, size_t last) {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
@@ -666,6 +816,8 @@ size_t monowire_mmap::size() const { return pimpl->size; }
 void *monowire_mmap::addr() const { return pimpl->addr; }
 
 void monowire_mmap::advise_fragment(size_t first, size_t last) { pimpl->advise_fragment(first, last); }
+void monowire_mmap::read_fragment(size_t first, size_t last) { pimpl->read_fragment(first, last); }
+bool monowire_mmap::read_to(size_t offset, void *dst, size_t size) { return pimpl->read_to(offset, dst, size); }
 void monowire_mmap::evict_fragment(size_t first, size_t last) { pimpl->evict_fragment(first, last); }
 void monowire_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

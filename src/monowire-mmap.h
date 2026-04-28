@@ -50,6 +50,8 @@ struct monowire_mmap {
     void *addr() const;
 
     void advise_fragment(size_t first, size_t last);
+    void read_fragment(size_t first, size_t last);
+    bool read_to(size_t offset, void *dst, size_t size);
     void evict_fragment(size_t first, size_t last);
     void unmap_fragment(size_t first, size_t last);
 

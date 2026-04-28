@@ -10,10 +10,10 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
-#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -29,20 +29,20 @@
 #include <vector>
 
 #if defined(__APPLE__) && defined(__MACH__)
-#include <sys/types.h>
 #include <sys/sysctl.h>
+#include <sys/types.h>
 #endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
-#   define NOMINMAX
+#define NOMINMAX
 #endif
-#include <locale>
-#include <windows.h>
-#include <string.h>
 #include <fcntl.h>
 #include <io.h>
+#include <locale>
+#include <string.h>
+#include <windows.h>
 #else
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -50,15 +50,16 @@
 #endif
 
 #if defined(__linux__)
-#include <sys/types.h>
 #include <pwd.h>
+#include <sys/types.h>
 #endif
 
 #if defined(_MSC_VER)
-#pragma warning(disable: 4244 4267) // possible loss of data
+#pragma warning(disable : 4244 4267) // possible loss of data
 #endif
 
-common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
+common_time_meas::common_time_meas(int64_t &t_acc, bool disable)
+    : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
 common_time_meas::~common_time_meas() {
     if (t_start_us >= 0) {
@@ -74,9 +75,9 @@ int32_t cpu_get_num_physical_cores() {
 #ifdef __linux__
     // enumerate the set of thread siblings, num entries is num cores
     std::unordered_set<std::string> siblings;
-    for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
-        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
-            + std::to_string(cpu) + "/topology/thread_siblings");
+    for (uint32_t cpu = 0; cpu < UINT32_MAX; ++cpu) {
+        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu" + std::to_string(cpu)
+                                      + "/topology/thread_siblings");
         if (!thread_siblings.is_open()) {
             break; // no more cpus
         }
@@ -112,18 +113,21 @@ int32_t cpu_get_num_physical_cores() {
     }
 
     std::vector<char> buffer(buffer_size);
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &buffer_size)) {
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+                                          &buffer_size)) {
         return default_threads;
     }
 
     int32_t num_physical_cores = 0;
-    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info
+        = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
     while (buffer_size > 0) {
         if (info->Relationship == RelationProcessorCore) {
             num_physical_cores += info->Processor.GroupCount;
         }
         buffer_size -= info->Size;
-        info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(reinterpret_cast<char*>(info) + info->Size);
+        info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(reinterpret_cast<char *>(info) + info->Size);
     }
 
     return num_physical_cores > 0 ? num_physical_cores : default_threads;
@@ -135,8 +139,7 @@ int32_t cpu_get_num_physical_cores() {
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
 #include <pthread.h>
 
-static void cpuid(unsigned leaf, unsigned subleaf,
-                  unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx) {
+static void cpuid(unsigned leaf, unsigned subleaf, unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx) {
     __asm__("movq\t%%rbx,%%rsi\n\t"
             "cpuid\n\t"
             "xchgq\t%%rbx,%%rsi"
@@ -216,15 +219,25 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 
     DWORD p = NORMAL_PRIORITY_CLASS;
     switch (prio) {
-        case GGML_SCHED_PRIO_LOW:      p = BELOW_NORMAL_PRIORITY_CLASS; break;
-        case GGML_SCHED_PRIO_NORMAL:   p = NORMAL_PRIORITY_CLASS;       break;
-        case GGML_SCHED_PRIO_MEDIUM:   p = ABOVE_NORMAL_PRIORITY_CLASS; break;
-        case GGML_SCHED_PRIO_HIGH:     p = HIGH_PRIORITY_CLASS;         break;
-        case GGML_SCHED_PRIO_REALTIME: p = REALTIME_PRIORITY_CLASS;     break;
+    case GGML_SCHED_PRIO_LOW:
+        p = BELOW_NORMAL_PRIORITY_CLASS;
+        break;
+    case GGML_SCHED_PRIO_NORMAL:
+        p = NORMAL_PRIORITY_CLASS;
+        break;
+    case GGML_SCHED_PRIO_MEDIUM:
+        p = ABOVE_NORMAL_PRIORITY_CLASS;
+        break;
+    case GGML_SCHED_PRIO_HIGH:
+        p = HIGH_PRIORITY_CLASS;
+        break;
+    case GGML_SCHED_PRIO_REALTIME:
+        p = REALTIME_PRIORITY_CLASS;
+        break;
     }
 
     if (!SetPriorityClass(GetCurrentProcess(), p)) {
-        LOG_WRN("failed to set process priority class %d : (%d)\n", prio, (int) GetLastError());
+        LOG_WRN("failed to set process priority class %d : (%d)\n", prio, (int)GetLastError());
         return false;
     }
 
@@ -232,8 +245,8 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 }
 
 #else // MacOS and POSIX
-#include <sys/types.h>
 #include <sys/resource.h>
+#include <sys/types.h>
 
 bool set_process_priority(enum ggml_sched_priority prio) {
     if (prio == GGML_SCHED_PRIO_NORMAL) {
@@ -242,11 +255,21 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 
     int p = 0;
     switch (prio) {
-        case GGML_SCHED_PRIO_LOW:      p =  5;  break;
-        case GGML_SCHED_PRIO_NORMAL:   p =  0;  break;
-        case GGML_SCHED_PRIO_MEDIUM:   p = -5;  break;
-        case GGML_SCHED_PRIO_HIGH:     p = -10; break;
-        case GGML_SCHED_PRIO_REALTIME: p = -20; break;
+    case GGML_SCHED_PRIO_LOW:
+        p = 5;
+        break;
+    case GGML_SCHED_PRIO_NORMAL:
+        p = 0;
+        break;
+    case GGML_SCHED_PRIO_MEDIUM:
+        p = -5;
+        break;
+    case GGML_SCHED_PRIO_HIGH:
+        p = -10;
+        break;
+    case GGML_SCHED_PRIO_REALTIME:
+        p = -20;
+        break;
     }
 
     if (setpriority(PRIO_PROCESS, 0, p) != 0) {
@@ -262,8 +285,7 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 // CLI argument parsing
 //
 
-
-void postprocess_cpu_params(cpu_params& cpuparams, const cpu_params* role_model) {
+void postprocess_cpu_params(cpu_params &cpuparams, const cpu_params *role_model) {
     int32_t n_set = 0;
 
     if (cpuparams.n_threads < 0) {
@@ -283,11 +305,12 @@ void postprocess_cpu_params(cpu_params& cpuparams, const cpu_params* role_model)
 
     if (n_set && n_set < cpuparams.n_threads) {
         // Not enough set bits, may experience performance issues.
-        LOG_WRN("Not enough set bits in CPU mask (%d) to satisfy requested thread count: %d\n", n_set, cpuparams.n_threads);
+        LOG_WRN("Not enough set bits in CPU mask (%d) to satisfy requested thread count: %d\n", n_set,
+                cpuparams.n_threads);
     }
 }
 
-bool parse_cpu_range(const std::string & range, bool (&boolmask)[GGML_MAX_N_THREADS]) {
+bool parse_cpu_range(const std::string &range, bool (&boolmask)[GGML_MAX_N_THREADS]) {
     size_t dash_loc = range.find('-');
     if (dash_loc == std::string::npos) {
         LOG_ERR("Format of CPU range is invalid! Expected [<start>]-[<end>].\n");
@@ -317,14 +340,12 @@ bool parse_cpu_range(const std::string & range, bool (&boolmask)[GGML_MAX_N_THRE
         }
     }
 
-    for (size_t i = start_i; i <= end_i; i++) {
-        boolmask[i] = true;
-    }
+    for (size_t i = start_i; i <= end_i; i++) { boolmask[i] = true; }
 
     return true;
 }
 
-bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREADS]) {
+bool parse_cpu_mask(const std::string &mask, bool (&boolmask)[GGML_MAX_N_THREADS]) {
     // Discard potential 0x prefix
     size_t start_i = 0;
     if (mask.length() >= 2 && mask.substr(0, 2) == "0x") {
@@ -332,11 +353,13 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
     }
 
     size_t num_digits = mask.length() - start_i;
-    if (num_digits > 128) num_digits = 128;
+    if (num_digits > 128) {
+        num_digits = 128;
+    }
 
     size_t end_i = num_digits + start_i;
 
-    for (size_t i = start_i, n = (num_digits*4 - 1); i < end_i; i++, n-=4) {
+    for (size_t i = start_i, n = (num_digits * 4 - 1); i < end_i; i++, n -= 4) {
         char c = mask.at(i);
         int8_t id = c;
 
@@ -351,7 +374,7 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
             return false;
         }
 
-        boolmask[  n  ] = boolmask[  n  ] || ((id & 8) != 0);
+        boolmask[n] = boolmask[n] || ((id & 8) != 0);
         boolmask[n - 1] = boolmask[n - 1] || ((id & 4) != 0);
         boolmask[n - 2] = boolmask[n - 2] || ((id & 2) != 0);
         boolmask[n - 3] = boolmask[n - 3] || ((id & 1) != 0);
@@ -369,15 +392,16 @@ void common_init() {
     monowire_log_set(common_log_default_callback, NULL);
 
 #ifdef NDEBUG
-    const char * build_type = "";
+    const char *build_type = "";
 #else
-    const char * build_type = " (debug)";
+    const char *build_type = " (debug)";
 #endif
 
-    LOG_DBG("build: %d (%s) with %s for %s%s\n", monowire_build_number(), monowire_commit(), monowire_compiler(), monowire_build_target(), build_type);
+    LOG_DBG("build: %d (%s) with %s for %s%s\n", monowire_build_number(), monowire_commit(), monowire_compiler(),
+            monowire_build_target(), build_type);
 }
 
-std::string common_params_get_system_info(const common_params & params) {
+std::string common_params_get_system_info(const common_params &params) {
     std::ostringstream os;
 
     os << "system_info: n_threads = " << params.cpuparams.n_threads;
@@ -399,7 +423,7 @@ std::string common_params_get_system_info(const common_params & params) {
 // String utils
 //
 
-std::string string_format(const char * fmt, ...) {
+std::string string_format(const char *fmt, ...) {
     va_list ap;
     va_list ap2;
     va_start(ap, fmt);
@@ -414,15 +438,11 @@ std::string string_format(const char * fmt, ...) {
     return std::string(buf.data(), size);
 }
 
-std::string string_strip(const std::string & str) {
+std::string string_strip(const std::string &str) {
     size_t start = 0;
     size_t end = str.size();
-    while (start < end && std::isspace(str[start])) {
-        start++;
-    }
-    while (end > start && std::isspace(str[end - 1])) {
-        end--;
-    }
+    while (start < end && std::isspace(str[start])) { start++; }
+    while (end > start && std::isspace(str[end - 1])) { end--; }
     return str.substr(start, end - start);
 }
 
@@ -434,15 +454,15 @@ std::string string_get_sortable_timestamp() {
     char timestamp_no_ns[100];
     std::strftime(timestamp_no_ns, 100, "%Y_%m_%d-%H_%M_%S", std::localtime(&as_time_t));
 
-    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        current_time.time_since_epoch() % 1000000000).count();
+    const int64_t ns
+        = std::chrono::duration_cast<std::chrono::nanoseconds>(current_time.time_since_epoch() % 1000000000).count();
     char timestamp_ns[11];
     snprintf(timestamp_ns, 11, "%09" PRId64, ns);
 
     return std::string(timestamp_no_ns) + "." + std::string(timestamp_ns);
 }
 
-void string_replace_all(std::string & s, const std::string & search, const std::string & replace) {
+void string_replace_all(std::string &s, const std::string &search, const std::string &replace) {
     if (search.empty()) {
         return;
     }
@@ -459,12 +479,12 @@ void string_replace_all(std::string & s, const std::string & search, const std::
     s = std::move(builder);
 }
 
-std::string regex_escape(const std::string & s) {
+std::string regex_escape(const std::string &s) {
     static const std::regex special_chars("[.^$|()*+?\\[\\]{}\\\\]");
     return std::regex_replace(s, special_chars, "\\$&");
 }
 
-std::string string_join(const std::vector<std::string> & values, const std::string & separator) {
+std::string string_join(const std::vector<std::string> &values, const std::string &separator) {
     std::ostringstream result;
     for (size_t i = 0; i < values.size(); ++i) {
         if (i > 0) {
@@ -475,7 +495,7 @@ std::string string_join(const std::vector<std::string> & values, const std::stri
     return result.str();
 }
 
-std::vector<std::string> string_split(const std::string & str, const std::string & delimiter) {
+std::vector<std::string> string_split(const std::string &str, const std::string &delimiter) {
     std::vector<std::string> parts;
     size_t start = 0;
     size_t end = str.find(delimiter);
@@ -491,7 +511,7 @@ std::vector<std::string> string_split(const std::string & str, const std::string
     return parts;
 }
 
-std::string string_repeat(const std::string & str, size_t n) {
+std::string string_repeat(const std::string &str, size_t n) {
     if (n == 0) {
         return "";
     }
@@ -499,18 +519,14 @@ std::string string_repeat(const std::string & str, size_t n) {
     std::string result;
     result.reserve(str.length() * n);
 
-    for (size_t i = 0; i < n; ++i) {
-        result += str;
-    }
+    for (size_t i = 0; i < n; ++i) { result += str; }
 
     return result;
 }
 
-std::string string_from(bool value) {
-    return value ? "true" : "false";
-}
+std::string string_from(bool value) { return value ? "true" : "false"; }
 
-std::string string_from(const std::vector<int> & values) {
+std::string string_from(const std::vector<int> &values) {
     std::stringstream buf;
 
     buf << "[ ";
@@ -528,13 +544,13 @@ std::string string_from(const std::vector<int> & values) {
     return buf.str();
 }
 
-std::string string_from(const struct monowire_context * ctx, const std::vector<monowire_token> & tokens) {
+std::string string_from(const struct monowire_context *ctx, const std::vector<monowire_token> &tokens) {
     std::stringstream buf;
 
     buf << "[ ";
 
     bool first = true;
-    for (const auto & token : tokens) {
+    for (const auto &token : tokens) {
         if (!first) {
             buf << ", ";
         } else {
@@ -552,7 +568,7 @@ std::string string_from(const struct monowire_context * ctx, const std::vector<m
     return buf.str();
 }
 
-std::string string_from(const struct monowire_context * ctx, const struct monowire_batch & batch) {
+std::string string_from(const struct monowire_context *ctx, const struct monowire_batch &batch) {
     std::stringstream buf;
 
     buf << "[ ";
@@ -567,12 +583,10 @@ std::string string_from(const struct monowire_context * ctx, const struct monowi
 
         auto detokenized = common_token_to_piece(ctx, batch.token[i]);
 
-        buf << "\n"          << std::to_string(i)
-            << ", token '"   << detokenized << "'"
-            << ", pos "      << std::to_string(batch.pos[i])
-            << ", n_seq_id " << std::to_string(batch.n_seq_id[i])
-            << ", seq_id "   << std::to_string(batch.seq_id[i][0])
-            << ", logits "   << std::to_string(batch.logits[i]);
+        buf << "\n"
+            << std::to_string(i) << ", token '" << detokenized << "'"
+            << ", pos " << std::to_string(batch.pos[i]) << ", n_seq_id " << std::to_string(batch.n_seq_id[i])
+            << ", seq_id " << std::to_string(batch.seq_id[i][0]) << ", logits " << std::to_string(batch.logits[i]);
     }
 
     buf << " ]";
@@ -580,34 +594,48 @@ std::string string_from(const struct monowire_context * ctx, const struct monowi
     return buf.str();
 }
 
-void string_process_escapes(std::string & input) {
+void string_process_escapes(std::string &input) {
     std::size_t input_len = input.length();
     std::size_t output_idx = 0;
 
     for (std::size_t input_idx = 0; input_idx < input_len; ++input_idx) {
         if (input[input_idx] == '\\' && input_idx + 1 < input_len) {
             switch (input[++input_idx]) {
-                case 'n':  input[output_idx++] = '\n'; break;
-                case 'r':  input[output_idx++] = '\r'; break;
-                case 't':  input[output_idx++] = '\t'; break;
-                case '\'': input[output_idx++] = '\''; break;
-                case '\"': input[output_idx++] = '\"'; break;
-                case '\\': input[output_idx++] = '\\'; break;
-                case 'x':
-                    // Handle \x12, etc
-                    if (input_idx + 2 < input_len) {
-                        const char x[3] = { input[input_idx + 1], input[input_idx + 2], 0 };
-                        char *err_p = nullptr;
-                        const long val = std::strtol(x, &err_p, 16);
-                        if (err_p == x + 2) {
-                            input_idx += 2;
-                            input[output_idx++] = char(val);
-                            break;
-                        }
+            case 'n':
+                input[output_idx++] = '\n';
+                break;
+            case 'r':
+                input[output_idx++] = '\r';
+                break;
+            case 't':
+                input[output_idx++] = '\t';
+                break;
+            case '\'':
+                input[output_idx++] = '\'';
+                break;
+            case '\"':
+                input[output_idx++] = '\"';
+                break;
+            case '\\':
+                input[output_idx++] = '\\';
+                break;
+            case 'x':
+                // Handle \x12, etc
+                if (input_idx + 2 < input_len) {
+                    const char x[3] = {input[input_idx + 1], input[input_idx + 2], 0};
+                    char *err_p = nullptr;
+                    const long val = std::strtol(x, &err_p, 16);
+                    if (err_p == x + 2) {
+                        input_idx += 2;
+                        input[output_idx++] = char(val);
+                        break;
                     }
-                    // fall through
-                default:   input[output_idx++] = '\\';
-                           input[output_idx++] = input[input_idx]; break;
+                }
+                // fall through
+            default:
+                input[output_idx++] = '\\';
+                input[output_idx++] = input[input_idx];
+                break;
             }
         } else {
             input[output_idx++] = input[input_idx];
@@ -617,8 +645,8 @@ void string_process_escapes(std::string & input) {
     input.resize(output_idx);
 }
 
-bool string_parse_kv_override(const char * data, std::vector<monowire_model_kv_override> & overrides) {
-    const char * sep = strchr(data, '=');
+bool string_parse_kv_override(const char *data, std::vector<monowire_model_kv_override> &overrides) {
+    const char *sep = strchr(data, '=');
     if (sep == nullptr || sep - data >= 128) {
         LOG_ERR("%s: malformed KV override '%s'\n", __func__, data);
         return false;
@@ -663,8 +691,8 @@ bool string_parse_kv_override(const char * data, std::vector<monowire_model_kv_o
     return true;
 }
 
-static inline bool glob_class_match(const char c, const char * pattern, const char * class_end) {
-    const char * class_start = pattern;
+static inline bool glob_class_match(const char c, const char *pattern, const char *class_end) {
+    const char *class_start = pattern;
     bool negated = false;
 
     if (*class_start == '!') {
@@ -704,20 +732,26 @@ static inline bool glob_class_match(const char c, const char * pattern, const ch
 }
 
 // simple glob: * matches non-/ chars, ** matches anything including /, [] matches character class
-static inline bool glob_match(const char * pattern, const char * str) {
+static inline bool glob_match(const char *pattern, const char *str) {
     if (*pattern == '\0') {
         return *str == '\0';
     }
     if (pattern[0] == '*' && pattern[1] == '*') {
-        const char * p = pattern + 2;
-        if (glob_match(p, str)) return true;
-        if (*str != '\0') return glob_match(pattern, str + 1);
+        const char *p = pattern + 2;
+        if (glob_match(p, str)) {
+            return true;
+        }
+        if (*str != '\0') {
+            return glob_match(pattern, str + 1);
+        }
         return false;
     }
     if (*pattern == '*') {
-        const char * p = pattern + 1;
+        const char *p = pattern + 1;
         for (; *str != '\0' && *str != '/'; str++) {
-            if (glob_match(p, str)) return true;
+            if (glob_match(p, str)) {
+                return true;
+            }
         }
         return glob_match(p, str);
     }
@@ -725,16 +759,16 @@ static inline bool glob_match(const char * pattern, const char * str) {
         return glob_match(pattern + 1, str + 1);
     }
     if (*pattern == '[') {
-        const char * class_end = pattern + 1;
+        const char *class_end = pattern + 1;
         // If first character after '[' is ']' or '-', treat it as literal
         if (*class_end == ']' || *class_end == '-') {
             class_end++;
         }
-        while (*class_end != '\0' && *class_end != ']') {
-            class_end++;
-        }
+        while (*class_end != '\0' && *class_end != ']') { class_end++; }
         if (*class_end == ']') {
-            if (*str == '\0') return false;
+            if (*str == '\0') {
+                return false;
+            }
             bool matched = glob_class_match(*str, pattern + 1, class_end);
             return matched && glob_match(class_end + 1, str + 1);
         } else {
@@ -750,9 +784,7 @@ static inline bool glob_match(const char * pattern, const char * str) {
     return false;
 }
 
-bool glob_match(const std::string & pattern, const std::string & str) {
-    return glob_match(pattern.c_str(), str.c_str());
-}
+bool glob_match(const std::string &pattern, const std::string &str) { return glob_match(pattern.c_str(), str.c_str()); }
 
 //
 // Filesystem utils
@@ -760,7 +792,7 @@ bool glob_match(const std::string & pattern, const std::string & str) {
 
 // Validate if a filename is safe to use
 // To validate a full path, split the path by the OS-specific path separator, and validate each part with this function
-bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
+bool fs_validate_filename(const std::string &filename, bool allow_subdirs) {
     if (!filename.length()) {
         // Empty filename invalid
         return false;
@@ -781,9 +813,8 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
         }
         uint32_t c = result.codepoint;
 
-        if ((result.bytes_consumed == 2 && c < 0x80) ||
-            (result.bytes_consumed == 3 && c < 0x800) ||
-            (result.bytes_consumed == 4 && c < 0x10000)) {
+        if ((result.bytes_consumed == 2 && c < 0x80) || (result.bytes_consumed == 3 && c < 0x800)
+            || (result.bytes_consumed == 4 && c < 0x10000)) {
             return false;
         }
 
@@ -794,17 +825,17 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
         // - UTF-8 replacement character
         // - Byte order mark (BOM)
         // - Illegal characters: / \ : * ? " < > |
-        if (c <= 0x1F // Control characters (C0)
-            || c == 0x7F // Control characters (DEL)
-            || (c >= 0x80 && c <= 0x9F) // Control characters (C1)
-            || c == 0xFF0E // Fullwidth Full Stop (period equivalent)
-            || c == 0x2215 // Division Slash (forward slash equivalent)
-            || c == 0x2216 // Set Minus (backslash equivalent)
+        if (c <= 0x1F                       // Control characters (C0)
+            || c == 0x7F                    // Control characters (DEL)
+            || (c >= 0x80 && c <= 0x9F)     // Control characters (C1)
+            || c == 0xFF0E                  // Fullwidth Full Stop (period equivalent)
+            || c == 0x2215                  // Division Slash (forward slash equivalent)
+            || c == 0x2216                  // Set Minus (backslash equivalent)
             || (c >= 0xD800 && c <= 0xDFFF) // UTF-16 surrogate pairs
-            || c > 0x10FFFF // Max Unicode limit
-            || c == 0xFFFD // Replacement Character (UTF-8)
-            || c == 0xFEFF // Byte Order Mark (BOM)
-            || c == ':' || c == '*' // Illegal characters
+            || c > 0x10FFFF                 // Max Unicode limit
+            || c == 0xFFFD                  // Replacement Character (UTF-8)
+            || c == 0xFEFF                  // Byte Order Mark (BOM)
+            || c == ':' || c == '*'         // Illegal characters
             || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
             return false;
         }
@@ -815,8 +846,8 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
         offset += result.bytes_consumed;
     }
 
-    // Reject any leading or trailing ' ', or any trailing '.', these are stripped on Windows and will cause a different filename
-    // Unicode and other whitespace is not affected, only 0x20 space
+    // Reject any leading or trailing ' ', or any trailing '.', these are stripped on Windows and will cause a different
+    // filename Unicode and other whitespace is not affected, only 0x20 space
     if (filename.front() == ' ' || filename.back() == ' ' || filename.back() == '.') {
         return false;
     }
@@ -836,9 +867,8 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
 
 #include <iostream>
 
-
 #ifdef _WIN32
-static std::wstring utf8_to_wstring(const std::string & str) {
+static std::wstring utf8_to_wstring(const std::string &str) {
     if (str.empty()) {
         return std::wstring();
     }
@@ -857,7 +887,7 @@ static std::wstring utf8_to_wstring(const std::string & str) {
 #endif
 
 // returns true if successful, false otherwise
-bool fs_create_directory_with_parents(const std::string & path) {
+bool fs_create_directory_with_parents(const std::string &path) {
 #ifdef _WIN32
     std::wstring wpath = utf8_to_wstring(path);
 
@@ -932,7 +962,7 @@ bool fs_create_directory_with_parents(const std::string & path) {
 #endif // _WIN32
 }
 
-bool fs_is_directory(const std::string & path) {
+bool fs_is_directory(const std::string &path) {
     std::filesystem::path dir(path);
     return std::filesystem::exists(dir) && std::filesystem::is_directory(dir);
 }
@@ -949,8 +979,7 @@ std::string fs_get_cache_directory() {
     if (getenv("MONOWIRE_CACHE")) {
         cache_directory = std::getenv("MONOWIRE_CACHE");
     } else {
-#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
-        defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || defined(__OpenBSD__) || defined(__NetBSD__)
         if (std::getenv("XDG_CACHE_HOME")) {
             cache_directory = std::getenv("XDG_CACHE_HOME");
         } else if (std::getenv("HOME")) {
@@ -964,7 +993,7 @@ std::string fs_get_cache_directory() {
             }
 
             cache_directory = std::string(pw->pw_dir) + std::string("/.cache/");
-#else /* defined(__linux__) */
+#else  /* defined(__linux__) */
             throw std::runtime_error("Failed to find $HOME directory");
 #endif /* defined(__linux__) */
         }
@@ -975,7 +1004,7 @@ std::string fs_get_cache_directory() {
 #elif defined(__EMSCRIPTEN__)
         GGML_ABORT("not implemented on this platform");
 #else
-#  error Unknown architecture
+#error Unknown architecture
 #endif
         cache_directory = ensure_trailing_slash(cache_directory);
         cache_directory += "monowire";
@@ -983,7 +1012,7 @@ std::string fs_get_cache_directory() {
     return ensure_trailing_slash(cache_directory);
 }
 
-std::string fs_get_cache_file(const std::string & filename) {
+std::string fs_get_cache_file(const std::string &filename) {
     GGML_ASSERT(filename.find(DIRECTORY_SEPARATOR) == std::string::npos);
     std::string cache_directory = fs_get_cache_directory();
     const bool success = fs_create_directory_with_parents(cache_directory);
@@ -993,35 +1022,35 @@ std::string fs_get_cache_file(const std::string & filename) {
     return cache_directory + filename;
 }
 
-std::vector<common_file_info> fs_list(const std::string & path, bool include_directories) {
+std::vector<common_file_info> fs_list(const std::string &path, bool include_directories) {
     std::vector<common_file_info> files;
-    if (path.empty()) return files;
+    if (path.empty()) {
+        return files;
+    }
 
     std::filesystem::path dir(path);
     if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
         return files;
     }
 
-    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
         try {
             // Only include regular files (skip directories)
-            const auto & p = entry.path();
+            const auto &p = entry.path();
             if (std::filesystem::is_regular_file(p)) {
                 common_file_info info;
-                info.path   = p.string();
-                info.name   = p.filename().string();
+                info.path = p.string();
+                info.name = p.filename().string();
                 info.is_dir = false;
                 try {
                     info.size = static_cast<size_t>(std::filesystem::file_size(p));
-                } catch (const std::filesystem::filesystem_error &) {
-                    info.size = 0;
-                }
+                } catch (const std::filesystem::filesystem_error &) { info.size = 0; }
                 files.push_back(std::move(info));
             } else if (include_directories && std::filesystem::is_directory(p)) {
                 common_file_info info;
-                info.path   = p.string();
-                info.name   = p.filename().string();
-                info.size   = 0; // Directories have no size
+                info.path = p.string();
+                info.name = p.filename().string();
+                info.size = 0; // Directories have no size
                 info.is_dir = true;
                 files.push_back(std::move(info));
             }
@@ -1040,14 +1069,14 @@ std::vector<common_file_info> fs_list(const std::string & path, bool include_dir
 
 bool tty_can_use_colors() {
     // Check NO_COLOR environment variable (https://no-color.org/)
-    if (const char * no_color = std::getenv("NO_COLOR")) {
+    if (const char *no_color = std::getenv("NO_COLOR")) {
         if (no_color[0] != '\0') {
             return false;
         }
     }
 
     // Check TERM environment variable
-    if (const char * term = std::getenv("TERM")) {
+    if (const char *term = std::getenv("TERM")) {
         if (std::strcmp(term, "dumb") == 0) {
             return false;
         }
@@ -1066,20 +1095,18 @@ bool tty_can_use_colors() {
 //
 
 // TODO: move to common/sampling
-static void common_init_sampler_from_model(
-    const monowire_model * model,
-    common_params_sampling & sparams) {
+static void common_init_sampler_from_model(const monowire_model *model, common_params_sampling &sparams) {
 
     const uint64_t config = sparams.user_sampling_config;
 
-    auto get_int32 = [&](const char * key, int32_t & dst, uint64_t user_config) {
+    auto get_int32 = [&](const char *key, int32_t &dst, uint64_t user_config) {
         if (config & user_config) {
             return;
         }
 
         char buf[64] = {0};
         if (monowire_model_meta_val_str(model, key, buf, sizeof(buf)) > 0) {
-            char * end = nullptr;
+            char *end = nullptr;
             int32_t v = strtol(buf, &end, 10);
             if (end && end != buf) {
                 dst = v;
@@ -1087,14 +1114,14 @@ static void common_init_sampler_from_model(
         }
     };
 
-    auto get_float = [&](const char * key, float & dst, uint64_t user_config) {
+    auto get_float = [&](const char *key, float &dst, uint64_t user_config) {
         if (config & user_config) {
             return;
         }
 
         char buf[128] = {0};
         if (monowire_model_meta_val_str(model, key, buf, sizeof(buf)) > 0) {
-            char * end = nullptr;
+            char *end = nullptr;
             float v = strtof(buf, &end);
             if (end && end != buf) {
                 dst = v;
@@ -1105,7 +1132,9 @@ static void common_init_sampler_from_model(
     // Sampling sequence
     if (!(config & common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS)) {
         char buf[512] = {0};
-        if (monowire_model_meta_val_str(model, monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_SEQUENCE), buf, sizeof(buf)) > 0) {
+        if (monowire_model_meta_val_str(model, monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_SEQUENCE),
+                                        buf, sizeof(buf))
+            > 0) {
             const std::vector<std::string> sampler_names = string_split<std::string>(std::string(buf), ';');
             if (!sampler_names.empty()) {
                 sparams.samplers = common_sampler_types_from_names(sampler_names, true);
@@ -1113,26 +1142,38 @@ static void common_init_sampler_from_model(
         }
     }
 
-    get_int32(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_TOP_K),           sparams.top_k,           common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K);
-    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_TOP_P),           sparams.top_p,           common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P);
-    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_MIN_P),           sparams.min_p,           common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P);
-    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_XTC_PROBABILITY), sparams.xtc_probability, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY);
-    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_XTC_THRESHOLD),   sparams.xtc_threshold,   common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD);
-    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_TEMP),            sparams.temp,            common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP);
-    get_int32(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_PENALTY_LAST_N),  sparams.penalty_last_n,  common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N);
-    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_PENALTY_REPEAT),  sparams.penalty_repeat,  common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT);
-    get_int32(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_MIROSTAT),        sparams.mirostat,        common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT);
-    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU),    sparams.mirostat_tau,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU);
-    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
+    get_int32(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_TOP_K), sparams.top_k,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K);
+    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_TOP_P), sparams.top_p,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P);
+    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_MIN_P), sparams.min_p,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P);
+    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_XTC_PROBABILITY), sparams.xtc_probability,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY);
+    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_XTC_THRESHOLD), sparams.xtc_threshold,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD);
+    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_TEMP), sparams.temp,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP);
+    get_int32(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_PENALTY_LAST_N), sparams.penalty_last_n,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N);
+    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_PENALTY_REPEAT), sparams.penalty_repeat,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT);
+    get_int32(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_MIROSTAT), sparams.mirostat,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT);
+    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU), sparams.mirostat_tau,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU);
+    get_float(monowire_model_meta_key_str(MONOWIRE_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA), sparams.mirostat_eta,
+              common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
 struct common_init_result::impl {
     impl() = default;
     ~impl() = default;
 
-    // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
+    // note: the order in which model, context, etc. are declared matters because their destructors will be called
+    // bottom-to-top
 
-    monowire_model_ptr   model;
+    monowire_model_ptr model;
     monowire_context_ptr context;
 
     std::vector<monowire_adapter_lora_ptr> lora;
@@ -1141,32 +1182,31 @@ struct common_init_result::impl {
     std::vector<monowire_sampler_seq_config> samplers_seq_config;
 };
 
-common_init_result::common_init_result(common_params & params) :
-    pimpl(new impl{}) {
+common_init_result::common_init_result(common_params &params) : pimpl(new impl{}) {
     auto mparams = common_model_params_to_monowire(params);
     auto cparams = common_context_params_to_monowire(params);
 
     if (params.fit_params) {
-        LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, "
+                "or provide --verbose logs if the bug only occurs with -fit on\n",
+                __func__);
+        common_fit_params(params.model.path.c_str(), &mparams, &cparams, params.tensor_split,
+                          params.tensor_buft_overrides.data(), params.fit_params_target.data(),
+                          params.fit_params_min_ctx,
+                          params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-    monowire_model * model = monowire_model_load_from_file(params.model.path.c_str(), mparams);
+    monowire_model *model = monowire_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
     }
 
     pimpl->model.reset(model);
 
-    const monowire_vocab * vocab = monowire_model_get_vocab(model);
+    const monowire_vocab *vocab = monowire_model_get_vocab(model);
 
     // load and optionally apply lora adapters
-    for (auto & la : params.lora_adapters) {
+    for (auto &la : params.lora_adapters) {
         monowire_adapter_lora_ptr lora;
         lora.reset(monowire_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
@@ -1203,36 +1243,35 @@ common_init_result::common_init_result(common_params & params) :
 
     if (params.sampling.ignore_eos) {
         // add EOG biases to the active set of logit biases
-        params.sampling.logit_bias.insert(
-                params.sampling.logit_bias.end(),
-                params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
+        params.sampling.logit_bias.insert(params.sampling.logit_bias.end(), params.sampling.logit_bias_eog.begin(),
+                                          params.sampling.logit_bias_eog.end());
     }
 
-    //if (params.sampling.penalty_last_n == -1) {
-    //    LOG_INF("%s: setting penalty_last_n to ctx_size = %d\n", __func__, monowire_n_ctx(lctx));
-    //    params.sampling.penalty_last_n = monowire_n_ctx(lctx);
-    //}
+    // if (params.sampling.penalty_last_n == -1) {
+    //     LOG_INF("%s: setting penalty_last_n to ctx_size = %d\n", __func__, monowire_n_ctx(lctx));
+    //     params.sampling.penalty_last_n = monowire_n_ctx(lctx);
+    // }
 
-    //if (params.sampling.dry_penalty_last_n == -1) {
-    //    LOG_INF("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, monowire_n_ctx(lctx));
-    //    params.sampling.dry_penalty_last_n = monowire_n_ctx(lctx);
-    //}
+    // if (params.sampling.dry_penalty_last_n == -1) {
+    //     LOG_INF("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, monowire_n_ctx(lctx));
+    //     params.sampling.dry_penalty_last_n = monowire_n_ctx(lctx);
+    // }
 
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
 
-    for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+    for (int i = 0; i < (int)cparams.n_seq_max; ++i) {
         pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
-        pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
+        pimpl->samplers_seq_config[i] = {i, common_sampler_get(pimpl->samplers[i].get())};
     }
 
     if (params.sampling.backend_sampling) {
-        cparams.samplers   = pimpl->samplers_seq_config.data();
+        cparams.samplers = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    monowire_context * lctx = monowire_init_from_model(model, cparams);
+    monowire_context *lctx = monowire_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return;
@@ -1241,47 +1280,41 @@ common_init_result::common_init_result(common_params & params) :
     pimpl->context.reset(lctx);
 }
 
-monowire_model * common_init_result::model() {
-    return pimpl->model.get();
-}
+monowire_model *common_init_result::model() { return pimpl->model.get(); }
 
-monowire_context * common_init_result::context() {
-    return pimpl->context.get();
-}
+monowire_context *common_init_result::context() { return pimpl->context.get(); }
 
-common_sampler * common_init_result::sampler(monowire_seq_id seq_id) {
-    if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
+common_sampler *common_init_result::sampler(monowire_seq_id seq_id) {
+    if (seq_id < 0 || seq_id >= (int)pimpl->samplers.size()) {
         return nullptr;
     }
     return pimpl->samplers[seq_id].get();
 }
 
 void common_init_result::reset_samplers() {
-    for (int i = 0; i < (int) pimpl->samplers.size(); ++i) {
+    for (int i = 0; i < (int)pimpl->samplers.size(); ++i) {
         monowire_sampler_reset(common_sampler_get(pimpl->samplers[i].get()));
     }
 }
 
-std::vector<monowire_adapter_lora_ptr> & common_init_result::lora() {
-    return pimpl->lora;
-}
+std::vector<monowire_adapter_lora_ptr> &common_init_result::lora() { return pimpl->lora; }
 
-common_init_result_ptr common_init_from_params(common_params & params) {
+common_init_result_ptr common_init_from_params(common_params &params) {
     common_init_result_ptr res(new common_init_result(params));
 
-    monowire_model * model = res->model();
+    monowire_model *model = res->model();
     if (model == NULL) {
         LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
         return res;
     }
 
-    monowire_context * lctx = res->context();
+    monowire_context *lctx = res->context();
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return res;
     }
 
-    const monowire_vocab * vocab = monowire_model_get_vocab(model);
+    const monowire_vocab *vocab = monowire_model_get_vocab(model);
 
     if (params.ctx_shift && !monowire_memory_can_shift(monowire_get_memory(lctx))) {
         LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
@@ -1289,21 +1322,20 @@ common_init_result_ptr common_init_from_params(common_params & params) {
     }
 
     if (!params.control_vectors.empty()) {
-        if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
-        if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = monowire_model_n_layer(model);
+        if (params.control_vector_layer_start <= 0) {
+            params.control_vector_layer_start = 1;
+        }
+        if (params.control_vector_layer_end <= 0) {
+            params.control_vector_layer_end = monowire_model_n_layer(model);
+        }
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
             return res;
         }
 
-        int err = monowire_set_adapter_cvec(
-                lctx,
-                cvec.data.data(),
-                cvec.data.size(),
-                cvec.n_embd,
-                params.control_vector_layer_start,
-                params.control_vector_layer_end);
+        int err = monowire_set_adapter_cvec(lctx, cvec.data.data(), cvec.data.size(), cvec.n_embd,
+                                            params.control_vector_layer_start, params.control_vector_layer_end);
         if (err) {
             return res;
         }
@@ -1322,7 +1354,9 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         bool has_rerank_prompt = monowire_model_chat_template(model, "rerank") != NULL;
 
         if (!has_eos && !has_sep && !has_rerank_prompt) {
-            LOG_WRN("%s: warning: vocab does not have an EOS token, SEP token, or rerank prompt. Reranking will not work\n", __func__);
+            LOG_WRN(
+                "%s: warning: vocab does not have an EOS token, SEP token, or rerank prompt. Reranking will not work\n",
+                __func__);
             ok = false;
         } else if (!has_eos) {
             LOG_WRN("%s: warning: vocab does not have an EOS token, using SEP token as fallback\n", __func__);
@@ -1367,7 +1401,7 @@ common_init_result_ptr common_init_from_params(common_params & params) {
             tmp.push_back(decoder_start_token_id);
         }
         if (monowire_model_has_decoder(model)) {
-            monowire_decode(lctx, monowire_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+            monowire_decode(lctx, monowire_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t)params.n_batch)));
         }
         monowire_memory_clear(monowire_get_memory(lctx), true);
         monowire_synchronize(lctx);
@@ -1384,10 +1418,10 @@ common_init_result_ptr common_init_from_params(common_params & params) {
 common_init_result::~common_init_result() = default;
 
 std::string common_get_model_endpoint() {
-    const char * model_endpoint_env = getenv("MODEL_ENDPOINT");
+    const char *model_endpoint_env = getenv("MODEL_ENDPOINT");
     // We still respect the use of environment-variable "HF_ENDPOINT" for backward-compatibility.
-    const char * hf_endpoint_env = getenv("HF_ENDPOINT");
-    const char * endpoint_env = model_endpoint_env ? model_endpoint_env : hf_endpoint_env;
+    const char *hf_endpoint_env = getenv("HF_ENDPOINT");
+    const char *endpoint_env = model_endpoint_env ? model_endpoint_env : hf_endpoint_env;
     std::string model_endpoint = "https://huggingface.co/";
     if (endpoint_env) {
         model_endpoint = endpoint_env;
@@ -1398,8 +1432,8 @@ std::string common_get_model_endpoint() {
     return model_endpoint;
 }
 
-common_context_seq_rm_type common_context_can_seq_rm(monowire_context * ctx) {
-    auto * mem = monowire_get_memory(ctx);
+common_context_seq_rm_type common_context_can_seq_rm(monowire_context *ctx) {
+    auto *mem = monowire_get_memory(ctx);
     if (mem == nullptr) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
@@ -1434,11 +1468,11 @@ done:
     return res;
 }
 
-void common_set_adapter_lora(struct monowire_context * ctx, std::vector<common_adapter_lora_info> & lora) {
+void common_set_adapter_lora(struct monowire_context *ctx, std::vector<common_adapter_lora_info> &lora) {
     std::vector<monowire_adapter_lora *> loras;
     std::vector<float> scales;
 
-    for (auto & la: lora) {
+    for (auto &la : lora) {
         loras.push_back(la.ptr);
         scales.push_back(la.scale);
     }
@@ -1446,27 +1480,30 @@ void common_set_adapter_lora(struct monowire_context * ctx, std::vector<common_a
     monowire_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
-struct monowire_model_params common_model_params_to_monowire(common_params & params) {
+struct monowire_model_params common_model_params_to_monowire(common_params &params) {
     auto mparams = monowire_model_default_params();
 
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
     }
 
-    mparams.n_gpu_layers    = params.n_gpu_layers;
-    mparams.main_gpu        = params.main_gpu;
-    mparams.split_mode      = params.split_mode;
-    mparams.tensor_split    = params.tensor_split;
-    mparams.use_mmap        = params.use_mmap;
-    mparams.use_direct_io   = params.use_direct_io;
-    mparams.use_mlock       = params.use_mlock;
+    mparams.n_gpu_layers = params.n_gpu_layers;
+    mparams.main_gpu = params.main_gpu;
+    mparams.split_mode = params.split_mode;
+    mparams.tensor_split = params.tensor_split;
+    mparams.use_mmap = params.use_mmap;
+    mparams.use_direct_io = params.use_direct_io;
+    mparams.use_mlock = params.use_mlock;
     mparams.streaming_budget_bytes = params.streaming_budget_bytes;
-    mparams.streaming_window       = params.streaming_window;
-    mparams.streaming_prefetch     = params.streaming_prefetch;
-    mparams.streaming_evict        = params.streaming_evict;
-    mparams.check_tensors   = params.check_tensors;
+    mparams.streaming_window = params.streaming_window;
+    mparams.streaming_io_threads = params.streaming_io_threads;
+    mparams.streaming_prefetch = params.streaming_prefetch;
+    mparams.streaming_evict = params.streaming_evict;
+    mparams.streaming_read_prefetch = params.streaming_read_prefetch;
+    mparams.streaming_direct_buffer = params.streaming_direct_buffer;
+    mparams.check_tensors = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
-    mparams.no_host         = params.no_host;
+    mparams.no_host = params.no_host;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1478,46 +1515,47 @@ struct monowire_model_params common_model_params_to_monowire(common_params & par
     if (params.tensor_buft_overrides.empty()) {
         mparams.tensor_buft_overrides = NULL;
     } else {
-        GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr && "Tensor buffer overrides not terminated with empty pattern");
+        GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr
+                    && "Tensor buffer overrides not terminated with empty pattern");
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
-    mparams.progress_callback           = params.load_progress_callback;
+    mparams.progress_callback = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
-    mparams.no_alloc                    = params.no_alloc;
+    mparams.no_alloc = params.no_alloc;
 
     return mparams;
 }
 
-struct monowire_context_params common_context_params_to_monowire(const common_params & params) {
+struct monowire_context_params common_context_params_to_monowire(const common_params &params) {
     auto cparams = monowire_context_default_params();
 
-    cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
-    cparams.n_batch           = params.n_batch;
-    cparams.n_ubatch          = params.n_ubatch;
-    cparams.n_threads         = params.cpuparams.n_threads;
-    cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
-                                params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
-    cparams.embeddings        = params.embedding;
+    cparams.n_ctx = params.n_ctx;
+    cparams.n_seq_max = params.n_parallel;
+    cparams.n_batch = params.n_batch;
+    cparams.n_ubatch = params.n_ubatch;
+    cparams.n_threads = params.cpuparams.n_threads;
+    cparams.n_threads_batch
+        = params.cpuparams_batch.n_threads == -1 ? params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
+    cparams.embeddings = params.embedding;
     cparams.rope_scaling_type = params.rope_scaling_type;
-    cparams.rope_freq_base    = params.rope_freq_base;
-    cparams.rope_freq_scale   = params.rope_freq_scale;
-    cparams.yarn_ext_factor   = params.yarn_ext_factor;
-    cparams.yarn_attn_factor  = params.yarn_attn_factor;
-    cparams.yarn_beta_fast    = params.yarn_beta_fast;
-    cparams.yarn_beta_slow    = params.yarn_beta_slow;
-    cparams.yarn_orig_ctx     = params.yarn_orig_ctx;
-    cparams.pooling_type      = params.pooling_type;
-    cparams.attention_type    = params.attention_type;
-    cparams.flash_attn_type   = params.flash_attn_type;
-    cparams.cb_eval           = params.cb_eval;
+    cparams.rope_freq_base = params.rope_freq_base;
+    cparams.rope_freq_scale = params.rope_freq_scale;
+    cparams.yarn_ext_factor = params.yarn_ext_factor;
+    cparams.yarn_attn_factor = params.yarn_attn_factor;
+    cparams.yarn_beta_fast = params.yarn_beta_fast;
+    cparams.yarn_beta_slow = params.yarn_beta_slow;
+    cparams.yarn_orig_ctx = params.yarn_orig_ctx;
+    cparams.pooling_type = params.pooling_type;
+    cparams.attention_type = params.attention_type;
+    cparams.flash_attn_type = params.flash_attn_type;
+    cparams.cb_eval = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
-    cparams.offload_kqv       = !params.no_kv_offload;
-    cparams.no_perf           = params.no_perf;
-    cparams.op_offload        = !params.no_op_offload;
-    cparams.swa_full          = params.swa_full;
-    cparams.kv_unified        = params.kv_unified;
+    cparams.offload_kqv = !params.no_kv_offload;
+    cparams.no_perf = params.no_perf;
+    cparams.op_offload = !params.no_op_offload;
+    cparams.swa_full = params.swa_full;
+    cparams.kv_unified = params.kv_unified;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
@@ -1525,7 +1563,7 @@ struct monowire_context_params common_context_params_to_monowire(const common_pa
     return cparams;
 }
 
-struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_params & params) {
+struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_params &params) {
     struct ggml_threadpool_params tpp;
 
     ggml_threadpool_params_init(&tpp, params.n_threads); // setup the defaults
@@ -1534,8 +1572,8 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_p
         std::memcpy(&tpp.cpumask, &params.cpumask, GGML_MAX_N_THREADS);
     }
 
-    tpp.prio       = params.priority;
-    tpp.poll       = params.poll;
+    tpp.prio = params.priority;
+    tpp.poll = params.poll;
     tpp.strict_cpu = params.strict_cpu;
 
     return tpp;
@@ -1545,25 +1583,17 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_p
 // Batch utils
 //
 
-void common_batch_clear(struct monowire_batch & batch) {
-    batch.n_tokens = 0;
-}
+void common_batch_clear(struct monowire_batch &batch) { batch.n_tokens = 0; }
 
-void common_batch_add(
-                 struct monowire_batch & batch,
-                        monowire_token   id,
-                          monowire_pos   pos,
-    const std::vector<monowire_seq_id> & seq_ids,
-                               bool   logits) {
+void common_batch_add(struct monowire_batch &batch, monowire_token id, monowire_pos pos,
+                      const std::vector<monowire_seq_id> &seq_ids, bool logits) {
     GGML_ASSERT(batch.seq_id[batch.n_tokens] && "monowire_batch size exceeded");
 
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
+    batch.token[batch.n_tokens] = id;
+    batch.pos[batch.n_tokens] = pos;
     batch.n_seq_id[batch.n_tokens] = seq_ids.size();
-    for (size_t i = 0; i < seq_ids.size(); ++i) {
-        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
-    }
-    batch.logits  [batch.n_tokens] = logits;
+    for (size_t i = 0; i < seq_ids.size(); ++i) { batch.seq_id[batch.n_tokens][i] = seq_ids[i]; }
+    batch.logits[batch.n_tokens] = logits;
 
     batch.n_tokens++;
 }
@@ -1572,31 +1602,28 @@ void common_batch_add(
 // Vocab utils
 //
 
-std::vector<monowire_token> common_tokenize(
-  const struct monowire_context * ctx,
-           const std::string & text,
-                        bool   add_special,
-                        bool   parse_special) {
-    const monowire_model * model = monowire_get_model(ctx);
-    const monowire_vocab * vocab = monowire_model_get_vocab(model);
+std::vector<monowire_token> common_tokenize(const struct monowire_context *ctx, const std::string &text,
+                                            bool add_special, bool parse_special) {
+    const monowire_model *model = monowire_get_model(ctx);
+    const monowire_vocab *vocab = monowire_model_get_vocab(model);
     return common_tokenize(vocab, text, add_special, parse_special);
 }
 
-std::vector<monowire_token> common_tokenize(
-    const struct monowire_vocab * vocab,
-           const std::string & text,
-                        bool   add_special,
-                        bool   parse_special) {
+std::vector<monowire_token> common_tokenize(const struct monowire_vocab *vocab, const std::string &text,
+                                            bool add_special, bool parse_special) {
     // upper limit for the number of tokens
     int n_tokens = text.length() + 2 * add_special;
     std::vector<monowire_token> result(n_tokens);
-    n_tokens = monowire_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+    n_tokens = monowire_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special,
+                                 parse_special);
     if (n_tokens == std::numeric_limits<int32_t>::min()) {
-        throw std::runtime_error("Tokenization failed: input text too large, tokenization result exceeds int32_t limit");
+        throw std::runtime_error(
+            "Tokenization failed: input text too large, tokenization result exceeds int32_t limit");
     }
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = monowire_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+        int check = monowire_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special,
+                                      parse_special);
         GGML_ASSERT(check == -n_tokens);
     } else {
         result.resize(n_tokens);
@@ -1604,42 +1631,45 @@ std::vector<monowire_token> common_tokenize(
     return result;
 }
 
-std::string common_token_to_piece(const struct monowire_context * ctx, monowire_token token, bool special) {
-    const monowire_model * model = monowire_get_model(ctx);
-    const monowire_vocab * vocab = monowire_model_get_vocab(model);
+std::string common_token_to_piece(const struct monowire_context *ctx, monowire_token token, bool special) {
+    const monowire_model *model = monowire_get_model(ctx);
+    const monowire_vocab *vocab = monowire_model_get_vocab(model);
     return common_token_to_piece(vocab, token, special);
 }
 
-std::string common_token_to_piece(const struct monowire_vocab * vocab, monowire_token token, bool special) {
+std::string common_token_to_piece(const struct monowire_vocab *vocab, monowire_token token, bool special) {
     std::string piece;
-    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    piece.resize(piece.capacity()); // using string internal cache, 15 bytes + '\n'
     const int n_chars = monowire_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
     if (n_chars < 0) {
         piece.resize(-n_chars);
         int check = monowire_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
         GGML_ASSERT(check == -n_chars);
-    }
-    else {
+    } else {
         piece.resize(n_chars);
     }
 
     return piece;
 }
 
-std::string common_detokenize(const struct monowire_context * ctx, const std::vector<monowire_token> & tokens, bool special) {
-    const monowire_model * model = monowire_get_model(ctx);
-    const monowire_vocab * vocab = monowire_model_get_vocab(model);
+std::string common_detokenize(const struct monowire_context *ctx, const std::vector<monowire_token> &tokens,
+                              bool special) {
+    const monowire_model *model = monowire_get_model(ctx);
+    const monowire_vocab *vocab = monowire_model_get_vocab(model);
     return common_detokenize(vocab, tokens, special);
 }
 
-std::string common_detokenize(const struct monowire_vocab * vocab, const std::vector<monowire_token> & tokens, bool special) {
+std::string common_detokenize(const struct monowire_vocab *vocab, const std::vector<monowire_token> &tokens,
+                              bool special) {
     std::string text;
     text.resize(std::max(text.capacity(), tokens.size()));
-    int32_t n_chars = monowire_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(), false, special);
+    int32_t n_chars = monowire_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(),
+                                          false, special);
     if (n_chars < 0) {
         text.resize(-n_chars);
-        n_chars = monowire_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(), false, special);
-        GGML_ASSERT(n_chars <= (int32_t)text.size());  // whitespace trimming is performed after per-token detokenization
+        n_chars = monowire_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(),
+                                      false, special);
+        GGML_ASSERT(n_chars <= (int32_t)text.size()); // whitespace trimming is performed after per-token detokenization
     }
 
     text.resize(n_chars);
@@ -1652,49 +1682,43 @@ std::string common_detokenize(const struct monowire_vocab * vocab, const std::ve
 // Embedding utils
 //
 
-void common_embd_normalize(const float * inp, float * out, int n, int embd_norm) {
+void common_embd_normalize(const float *inp, float *out, int n, int embd_norm) {
     double sum = 0.0;
 
     switch (embd_norm) {
-        case -1: // no normalisation
-            sum = 1.0;
-            break;
-        case 0: // max absolute
-            for (int i = 0; i < n; i++) {
-                if (sum < std::abs(inp[i])) {
-                    sum = std::abs(inp[i]);
-                }
+    case -1: // no normalisation
+        sum = 1.0;
+        break;
+    case 0: // max absolute
+        for (int i = 0; i < n; i++) {
+            if (sum < std::abs(inp[i])) {
+                sum = std::abs(inp[i]);
             }
-            sum /= 32760.0; // make an int16 range
-            break;
-        case 2: // euclidean
-            for (int i = 0; i < n; i++) {
-                sum += inp[i] * inp[i];
-            }
-            sum = std::sqrt(sum);
-            break;
-        default: // p-norm (euclidean is p-norm p=2)
-            for (int i = 0; i < n; i++) {
-                sum += std::pow(std::abs(inp[i]), embd_norm);
-            }
-            sum = std::pow(sum, 1.0 / embd_norm);
-            break;
+        }
+        sum /= 32760.0; // make an int16 range
+        break;
+    case 2: // euclidean
+        for (int i = 0; i < n; i++) { sum += inp[i] * inp[i]; }
+        sum = std::sqrt(sum);
+        break;
+    default: // p-norm (euclidean is p-norm p=2)
+        for (int i = 0; i < n; i++) { sum += std::pow(std::abs(inp[i]), embd_norm); }
+        sum = std::pow(sum, 1.0 / embd_norm);
+        break;
     }
 
     const float norm = sum > 0.0 ? 1.0 / sum : 0.0f;
 
-    for (int i = 0; i < n; i++) {
-        out[i] = inp[i] * norm;
-    }
+    for (int i = 0; i < n; i++) { out[i] = inp[i] * norm; }
 }
 
-float common_embd_similarity_cos(const float * embd1, const float * embd2, int n){
-    double sum  = 0.0;
+float common_embd_similarity_cos(const float *embd1, const float *embd2, int n) {
+    double sum = 0.0;
     double sum1 = 0.0;
     double sum2 = 0.0;
 
     for (int i = 0; i < n; i++) {
-        sum  += embd1[i] * embd2[i];
+        sum += embd1[i] * embd2[i];
         sum1 += embd1[i] * embd1[i];
         sum2 += embd2[i] * embd2[i];
     }
@@ -1714,15 +1738,15 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
 // Control vector utils
 //
 
-static common_control_vector_data common_control_vector_load_one(const common_control_vector_load_info & load_info) {
-    common_control_vector_data result = { -1, {} };
+static common_control_vector_data common_control_vector_load_one(const common_control_vector_load_info &load_info) {
+    common_control_vector_data result = {-1, {}};
 
-    ggml_context * ctx = nullptr;
+    ggml_context *ctx = nullptr;
     struct gguf_init_params meta_gguf_params = {
         /* .no_alloc = */ false,
         /* .ctx      = */ &ctx,
     };
-    struct gguf_context * ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params);
+    struct gguf_context *ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params);
     if (!ctx_gguf) {
         LOG_ERR("%s: failed to load control vector file from %s\n", __func__, load_info.fname.c_str());
         return result;
@@ -1743,9 +1767,7 @@ static common_control_vector_data common_control_vector_load_one(const common_co
         if (dotpos != std::string::npos && name.substr(0, dotpos) == "direction") {
             try {
                 layer_idx = std::stoi(name.substr(dotpos + 1));
-            } catch (...) {
-                layer_idx = -1;
-            }
+            } catch (...) { layer_idx = -1; }
         }
         if (layer_idx < 0) {
             LOG_ERR("%s: invalid/unparsable direction tensor layer index in %s\n", __func__, load_info.fname.c_str());
@@ -1757,7 +1779,7 @@ static common_control_vector_data common_control_vector_load_one(const common_co
             break;
         }
 
-        struct ggml_tensor * tensor = ggml_get_tensor(ctx, name.c_str());
+        struct ggml_tensor *tensor = ggml_get_tensor(ctx, name.c_str());
         if (tensor->type != GGML_TYPE_F32) {
             LOG_ERR("%s: invalid (non-F32) direction tensor type in %s\n", __func__, load_info.fname.c_str());
             result.n_embd = -1;
@@ -1772,7 +1794,8 @@ static common_control_vector_data common_control_vector_load_one(const common_co
         if (result.n_embd == -1) {
             result.n_embd = ggml_nelements(tensor);
         } else if (ggml_nelements(tensor) != result.n_embd) {
-            LOG_ERR("%s: direction tensor in %s does not match previous dimensions\n", __func__, load_info.fname.c_str());
+            LOG_ERR("%s: direction tensor in %s does not match previous dimensions\n", __func__,
+                    load_info.fname.c_str());
             result.n_embd = -1;
             break;
         }
@@ -1780,12 +1803,11 @@ static common_control_vector_data common_control_vector_load_one(const common_co
         // extend if necessary - do not store data for layer 0 (it's not used)
         result.data.resize(std::max(result.data.size(), static_cast<size_t>(result.n_embd * layer_idx)), 0.0f);
 
-        const float * src = (const float *) tensor->data;
-        float * dst = result.data.data() + result.n_embd * (layer_idx - 1);  // layer 1 at [0]
+        const float *src = (const float *)tensor->data;
+        float *dst = result.data.data() + result.n_embd * (layer_idx - 1); // layer 1 at [0]
         for (int j = 0; j < result.n_embd; j++) {
-            dst[j] += src[j] * load_info.strength;  // allows multiple directions for same layer in same file
+            dst[j] += src[j] * load_info.strength; // allows multiple directions for same layer in same file
         }
-
     }
 
     if (result.n_embd == -1) {
@@ -1799,10 +1821,10 @@ static common_control_vector_data common_control_vector_load_one(const common_co
     return result;
 }
 
-common_control_vector_data common_control_vector_load(const std::vector<common_control_vector_load_info> & load_infos) {
-    common_control_vector_data result = { -1, {} };
+common_control_vector_data common_control_vector_load(const std::vector<common_control_vector_load_info> &load_infos) {
+    common_control_vector_data result = {-1, {}};
 
-    for (const auto & info : load_infos) {
+    for (const auto &info : load_infos) {
         auto cur = common_control_vector_load_one(info);
 
         if (cur.n_embd == -1) {
@@ -1818,10 +1840,8 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
         if (result.n_embd == -1) {
             result = std::move(cur);
         } else {
-            result.data.resize(std::max(result.data.size(), cur.data.size()), 0.0f);  // extend if necessary
-            for (size_t i = 0; i < cur.data.size(); i++) {
-                result.data[i] += cur.data[i];
-            }
+            result.data.resize(std::max(result.data.size(), cur.data.size()), 0.0f); // extend if necessary
+            for (size_t i = 0; i < cur.data.size(); i++) { result.data[i] += cur.data[i]; }
         }
     }
 
@@ -1833,33 +1853,35 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
     return result;
 }
 
-ggml_opt_dataset_t common_opt_dataset_init(struct monowire_context * ctx, const std::vector<monowire_token> & tokens, int64_t stride) {
+ggml_opt_dataset_t common_opt_dataset_init(struct monowire_context *ctx, const std::vector<monowire_token> &tokens,
+                                           int64_t stride) {
     const int64_t ne_datapoint = monowire_n_ctx(ctx);
-    const int64_t ndata        = (tokens.size() - ne_datapoint - 1) / stride;
-    ggml_opt_dataset_t result = ggml_opt_dataset_init(
-        GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/ 1);
+    const int64_t ndata = (tokens.size() - ne_datapoint - 1) / stride;
+    ggml_opt_dataset_t result
+        = ggml_opt_dataset_init(GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/1);
 
-    monowire_token * data   = (monowire_token *) ggml_opt_dataset_data(result)->data;
-    monowire_token * labels = (monowire_token *) ggml_opt_dataset_labels(result)->data;
+    monowire_token *data = (monowire_token *)ggml_opt_dataset_data(result)->data;
+    monowire_token *labels = (monowire_token *)ggml_opt_dataset_labels(result)->data;
 
     for (int64_t idata = 0; idata < ndata; ++idata) {
-        memcpy(data   + idata*ne_datapoint, tokens.data() + idata*stride + 0, ne_datapoint*sizeof(monowire_token));
-        memcpy(labels + idata*ne_datapoint, tokens.data() + idata*stride + 1, ne_datapoint*sizeof(monowire_token));
+        memcpy(data + idata * ne_datapoint, tokens.data() + idata * stride + 0, ne_datapoint * sizeof(monowire_token));
+        memcpy(labels + idata * ne_datapoint, tokens.data() + idata * stride + 1,
+               ne_datapoint * sizeof(monowire_token));
     }
 
     return result;
 }
 
-ggml_opt_optimizer_params common_opt_lr_pars(void * userdata) {
+ggml_opt_optimizer_params common_opt_lr_pars(void *userdata) {
     ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(nullptr);
-    const lr_opt &            d      = *(lr_opt *) userdata;
+    const lr_opt &d = *(lr_opt *)userdata;
     result.adamw.alpha = result.sgd.alpha = d.get_lr(d.epoch);
     result.sgd.wd = result.adamw.wd = d.wd;
     return result;
 }
 
 // TODO make all command line args case-insensitive
-static inline bool eq_case_insensitive(char const* a, char const* b) {
+static inline bool eq_case_insensitive(char const *a, char const *b) {
     return !
 #if defined(_MSC_VER)
         _stricmp
@@ -1869,7 +1891,7 @@ static inline bool eq_case_insensitive(char const* a, char const* b) {
         (a, b);
 }
 
-enum ggml_opt_optimizer_type common_opt_get_optimizer(const char * n) {
+enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *n) {
     if (eq_case_insensitive("adamw", n)) {
         return GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     }
@@ -1885,7 +1907,7 @@ static float const k_log_2 = std::log(2.f);
 void lr_opt::init() {
     if (lr_min > 0 && lr_min < lr0) {
         float nhalf = std::log(lr0 / lr_min) / k_log_2;
-        float e     = epochs;
+        float e = epochs;
         if (decay_epochs > 0 && decay_epochs < e) {
             e = decay_epochs;
         } else {
@@ -1896,14 +1918,12 @@ void lr_opt::init() {
 }
 
 float lr_opt::get_lr(float epoch) const {
-    float r = lr_min <= 0 ? lr0 :
-        epoch >= decay_epochs ? lr_min :
-        lr0 * std::pow(0.5f, epoch * scale_epoch);
+    float r = lr_min <= 0 ? lr0 : epoch >= decay_epochs ? lr_min : lr0 * std::pow(0.5f, epoch * scale_epoch);
     LOG_INF("epoch %.2g lr=%.2g\n", epoch, r);
     return r;
 }
 
-bool common_replay_last_token(struct monowire_context * ctx, monowire_token last_token, int32_t pos) {
+bool common_replay_last_token(struct monowire_context *ctx, monowire_token last_token, int32_t pos) {
     monowire_batch batch = monowire_batch_get_one(&last_token, 1);
     batch.pos = &pos;
     if (monowire_decode(ctx, batch)) {
@@ -1913,13 +1933,8 @@ bool common_replay_last_token(struct monowire_context * ctx, monowire_token last
     return true;
 }
 
-bool common_prompt_batch_decode(
-              struct monowire_context * ctx,
-    const std::vector<monowire_token> & tokens,
-                               int & n_past,
-                               int   n_batch,
-                  std::string_view   state_path,
-                              bool   save_state) {
+bool common_prompt_batch_decode(struct monowire_context *ctx, const std::vector<monowire_token> &tokens, int &n_past,
+                                int n_batch, std::string_view state_path, bool save_state) {
     const int n_eval = tokens.size();
     if (n_eval == 0) {
         return true;
@@ -1935,7 +1950,8 @@ bool common_prompt_batch_decode(
         // Memory implementations in recurrent/hybrid models don't support removing tokens from their
         // memory, so we can't just remove the last token from the memory and replay the last token which
         // is the reason for this logic.
-        if (monowire_decode(ctx, monowire_batch_get_one(const_cast<monowire_token*>(tokens.data()), n_tokens_before_last))) {
+        if (monowire_decode(
+                ctx, monowire_batch_get_one(const_cast<monowire_token *>(tokens.data()), n_tokens_before_last))) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
         }
@@ -1955,7 +1971,7 @@ bool common_prompt_batch_decode(
         }
         n_past++;
     } else {
-        if (monowire_decode(ctx, monowire_batch_get_one(const_cast<monowire_token*>(tokens.data()), n_eval))) {
+        if (monowire_decode(ctx, monowire_batch_get_one(const_cast<monowire_token *>(tokens.data()), n_eval))) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
         }
