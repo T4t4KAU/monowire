@@ -1,0 +1,16 @@
+find_package(Threads REQUIRED)
+
+monowire_add_compile_flags()
+
+if (EMSCRIPTEN)
+else()
+    if (MONOWIRE_BUILD_CLI)
+        add_subdirectory(completion)
+    endif()
+    if (MONOWIRE_BUILD_BENCH)
+        add_subdirectory(monowire-bench)
+    endif()
+    if (MONOWIRE_BUILD_QUANTIZE)
+        add_subdirectory(quantize)
+    endif()
+endif()

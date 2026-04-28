@@ -1,0 +1,35 @@
+#include "build-info.h"
+
+#include <cstdio>
+#include <string>
+
+int MONOWIRE_BUILD_NUMBER = @MONOWIRE_BUILD_NUMBER@;
+char const * MONOWIRE_COMMIT = "@MONOWIRE_BUILD_COMMIT@";
+char const * MONOWIRE_COMPILER = "@BUILD_COMPILER@";
+char const * MONOWIRE_BUILD_TARGET = "@BUILD_TARGET@";
+
+int monowire_build_number(void) {
+    return MONOWIRE_BUILD_NUMBER;
+}
+
+const char * monowire_commit(void) {
+    return MONOWIRE_COMMIT;
+}
+
+const char * monowire_compiler(void) {
+    return MONOWIRE_COMPILER;
+}
+
+const char * monowire_build_target(void) {
+    return MONOWIRE_BUILD_TARGET;
+}
+
+const char * monowire_build_info(void) {
+    static std::string s = "b" + std::to_string(MONOWIRE_BUILD_NUMBER) + "-" + MONOWIRE_COMMIT;
+    return s.c_str();
+}
+
+void monowire_print_build_info(void) {
+    fprintf(stderr, "%s: build = %d (%s)\n",      __func__, monowire_build_number(), monowire_commit());
+    fprintf(stderr, "%s: built with %s for %s\n", __func__, monowire_compiler(), monowire_build_target());
+}
