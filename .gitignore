@@ -1,0 +1,51 @@
+# Python environments and generated package metadata
+/.venv/
+/.venv-*/
+/venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tool caches and coverage reports
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.tox/
+.nox/
+.coverage
+.coverage.*
+/coverage.xml
+/htmlcov/
+.ipynb_checkpoints/
+
+# Machine-specific editor and OS files
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local environment secrets; keep example configuration trackable
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Experiments and runtime artifacts belong outside the inference repository
+/experiments/
+/work/
+/outputs/
+/logs/
+/traces/
+/checkpoints/
+*.log
+
+# Private connection configuration and credentials
+/.ssh/
+*.pem
+*.key

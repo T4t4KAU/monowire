@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from collections.abc import Mapping
+
+import torch
+
+# ``OmniCustomPrompt`` keys that carry caller-tokenized ids. The native vLLM
+# spelling ``prompt_token_ids`` is deliberately not listed: multi-stage models
+# use it to hand an AR stage's tokens to their diffusion stage.
+PRE_TOKENIZED_PROMPT_KEYS = ("prompt_ids", "negative_prompt_ids")
+
+
+def pre_tokenized_prompt_keys(prompt: object) -> list[str]:
+    """Return the ``OmniCustomPrompt`` id fields a request actually populates."""
+    if not isinstance(prompt, Mapping):
+        return []
+    populated = []
+    for key in PRE_TOKENIZED_PROMPT_KEYS:
+        token_ids = prompt.get(key)
+        if token_ids is None:
+            continue
+        try:
+            size = token_ids.numel() if isinstance(token_ids, torch.Tensor) else len(token_ids)
+        except TypeError:
+            # Unsized values must still reach the admission-time client error.
+            size = 1
+        if size > 0:
+            populated.append(key)
+    return populated
+
+
+def validate_prompt_sequence_lengths(
+    attention_mask: torch.Tensor,
+    *,
+    max_sequence_length: int,
+    supported_max_sequence_length: int,
+    prompt_name: str = "prompt",
+    length_offset: int = 0,
+    baseline_attention_mask: torch.Tensor | None = None,
+    error_context: str,
+) -> None:
+    sequence_lengths = attention_mask.sum(dim=1)
+    if baseline_attention_mask is not None:
+        # Some callers need to validate only the user-controlled portion of a
+        # templated prompt. In those cases we subtract the fully-tokenized
+        # template baseline instead of only removing a fixed prefix length,
+        # because the template may also contribute a suffix or image markers.
+        baseline_lengths = baseline_attention_mask.sum(dim=1)
+        if baseline_lengths.shape[0] == 1 and sequence_lengths.shape[0] > 1:
+            baseline_lengths = baseline_lengths.expand(sequence_lengths.shape[0])
+        sequence_lengths = sequence_lengths - baseline_lengths
+    if length_offset:
+        sequence_lengths = sequence_lengths - length_offset
+    sequence_lengths = torch.clamp(sequence_lengths, min=0)
+    too_long = torch.nonzero(sequence_lengths > max_sequence_length, as_tuple=False)
+    if too_long.numel() == 0:
+        return
+
+    batch_idx = int(too_long[0].item())
+    actual_length = int(sequence_lengths[batch_idx].item())
+    prompt_ref = f"`{prompt_name}` at batch index {batch_idx}" if attention_mask.shape[0] > 1 else f"`{prompt_name}`"
+    raise ValueError(
+        f"{prompt_ref} is too long {error_context}: got {actual_length} tokens, but "
+        f"`max_sequence_length` is {max_sequence_length}. Shorten the prompt or increase "
+        f"`max_sequence_length` up to {supported_max_sequence_length}."
+    )

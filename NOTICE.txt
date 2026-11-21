@@ -1,0 +1,12 @@
+MonoWire's original framework code is licensed under the MIT License in LICENSE.
+
+The bundled source under third_party/vllm-omni retains its upstream licenses
+and copyright notices. It is not relicensed under MonoWire's MIT License.
+vLLM-Omni is licensed under Apache-2.0; see third_party/vllm-omni/LICENSE.
+Embedded third-party components retain the notices supplied in their directories.
+MonoWire modifications within this bundled source are also under Apache-2.0.
+
+Upstream: https://github.com/vllm-project/vllm-omni
+Revision: 5917730a4b02aedb44d374173cdc1b10484ccd52
+Source provenance and modifications: third_party/vllm-omni/UPSTREAM.md
+Runtime requirements: runtime.lock.json

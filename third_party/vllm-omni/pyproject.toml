@@ -1,0 +1,178 @@
+# MonoWire modification: fixed source version without a nested Git checkout.
+[build-system]
+requires = [
+    "setuptools>=77.0.3,<81.0.0",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-omni"
+dynamic = ["version", "dependencies"]
+description = "A framework for efficient model inference with omni-modality models"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+authors = [
+    {name = "vLLM-Omni Team"}
+]
+keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# Dependencies are now managed dynamically via setup.py based on detected hardware platform.
+# This allows automatic installation of the correct platform-specific dependencies (CUDA/ROCm/CPU/XPU/NPU)
+# without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
+
+[project.optional-dependencies]
+
+forced-aligner = [
+    "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
+]
+
+indextts2 = [
+    "fugashi>=1.2.0",
+    "unidic-lite>=1.0.0",
+    "wetext>=0.0.9; sys_platform != 'linux'",
+    "WeTextProcessing; sys_platform == 'linux'",
+]
+
+# LongCat-Video-Avatar A2V/AI2V runtime dependencies for vocal
+# separation and loudness normalization.
+longcat-video-avatar = [
+    "audio-separator==0.44.2",
+    "pyloudnorm==0.1.1",
+    "soundfile>=0.13.1",
+]
+
+# Optional torch-based fallback for server-side Silero VAD.
+server-vad = [
+    "silero-vad",
+]
+
+# Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
+# as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
+quack = [
+    "quack-kernels>=0.3.11",
+]
+
+# Optional Blackwell-native FlashAttention-4 backend. Keep this opt-in because
+# the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
+fa4 = [
+    "flash-attn-4[cu13]==4.0.0b18",
+]
+
+# FastVideo VSA kernels for the supported Linux/Python 3.12 wheel environment.
+vsa = [
+    "fastvideo-kernel==0.3.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/vllm-project/vllm-omni"
+Repository = "https://github.com/vllm-project/vllm-omni"
+Documentation = "https://vllm-omni.readthedocs.io"
+"Bug Tracker" = "https://github.com/vllm-project/vllm-omni/issues"
+
+[project.scripts]
+vllm-omni = "vllm_omni.entrypoints.cli.main:main"
+
+# Register vllm-omni's model registrations on every vllm subprocess. vllm
+# auto-loads anything advertised under `vllm.general_plugins` in its own
+# `load_general_plugins()`, so worker subprocesses spawned by vllm (which
+# only import vllm, not vllm_omni) will still pick up the omni archs.
+[project.entry-points."vllm.general_plugins"]
+vllm_omni_register_models = "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_omni*"]
+
+[tool.setuptools.package-data]
+"vllm_omni" = [
+    "_version.py",
+    "py.typed",
+    "deploy/*.md",
+    "deploy/*.yaml",
+    "diffusion/distributed/csrc/*.cu",
+    "diffusion/distributed/csrc/*.hpp",
+    "model_executor/models/covo_audio/speaker_prompt/*.npy",
+    "model_executor/models/step_audio2/assets/*.wav",
+    "transformers_utils/chat_templates/*.jinja",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "vllm_omni._version.__version__"}
+
+[tool.ruff]
+line-length = 120
+# Preserve the existing lint policy when raising the runtime Python floor.
+target-version = "py310"
+exclude = [
+    ".eggs",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "build",
+    "dist",
+    "vllm_omni.egg-info",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort (handled separately, but included for compatibility)
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "TID251", # flake8-tidy-imports.banned-api
+    "TC004",  # flake8-type-checking: runtime-used imports
+]
+ignore = [
+    "E203",  # whitespace before ':' (conflicts with black)
+    # W503 is not needed in ruff as it's compatible with black by default
+    "N801",  # class names should use CapWords convention
+    "N802",  # function name should follow snake_case
+    "N806",  # variable in function should follow snake_case
+    "N812",  # lowercase imported as non-lowercase: functional as F
+]
+
+[tool.ruff.lint.per-file-ignores]
+# MiniCPM-o reference modeling code vendored from upstream HF/transformers/MiniCPM-o.
+# These files keep upstream conventions (star imports, long lines, math-symbol
+# argument names) so they stay easy to diff against upstream releases.
+"vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
+# NemotronVoiceChat inference modules vendored from NVIDIA-NeMo/Speech (branch
+# nemotron-labs-voicechat). Numerics-bearing code is kept byte-close to
+# upstream to stay diffable and parity-safe, so upstream style (long lines,
+# legacy typing, whitespace, unused-import shims) is exempted. TID251 and the
+# F-correctness rules still apply.
+"vllm_omni/model_executor/models/nemotron_voicechat/nemo_vendored/**" = ["E501", "E721", "E741", "F401", "F841", "I001", "N803", "N814", "UP006", "UP007", "UP008", "UP011", "UP032", "UP035", "W291", "W293"]
+"vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
+# Kandinsky 6 keeps native/BigVGAN names (T/H/W, `l`) and NVIDIA vocoder
+# docstring length so the port stays diffable against the source modules.
+"vllm_omni/diffusion/models/kandinsky6/kandinsky6_transformer.py" = ["N803", "E741"]
+"vllm_omni/diffusion/models/kandinsky6/pipeline_kandinsky6.py" = ["N803"]
+"vllm_omni/diffusion/models/kandinsky6/modeling_kandinsky6_audio.py" = ["E501", "E741", "N803", "UP008"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
+"torch.cuda.max_memory_allocated".msg = "Use torch.accelerator.max_memory_allocated"
+"torch.cuda.reset_peak_memory_stats".msg = "Use torch.accelerator.reset_peak_memory_stats"
+"torch.cuda.device_count".msg = "Use torch.accelerator.device_count"
+"torch.cuda.current_device".msg = "Use torch.accelerator.current_device_index"
+"torch.cuda.empty_cache".msg  = "Use torch.accelerator.empty_cache"
+"torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"

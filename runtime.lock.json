@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/vllm-project/vllm-omni.git",
+  "commit": "5917730a4b02aedb44d374173cdc1b10484ccd52",
+  "python": ">=3.11,<3.14",
+  "architecture": "MiniMaxH3Pipeline",
+  "plugin_class": "MonoWireH3Pipeline",
+  "vllm_version": "0.32.0+cu129",
+  "source_directory": "third_party/vllm-omni",
+  "source_version": "0.32.0+monowire.g5917730a",
+  "torch_version": "2.13.0+cu129",
+  "cuda_version": "12.9",
+  "vllm_commit": "5df63a7203cdb9328d824a27b682e77c7b9928be"
+}

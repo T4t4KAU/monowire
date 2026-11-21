@@ -1,0 +1,989 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
+import os
+from collections import Counter
+from collections.abc import Iterable, Sequence
+from contextlib import nullcontext
+from typing import Any
+
+import torch
+import torch.nn as nn
+from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
+from vllm.model_executor.model_loader import DefaultModelLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+
+from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
+
+from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2Config,
+)
+from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2Decoder,
+)
+
+logger = init_logger(__name__)
+
+_DUMMY_REQUEST_ID = "__qwen3_tts_dummy_run__"
+
+
+def _codec_ids_from_payload_or_input(
+    input_ids: torch.Tensor,
+    runtime_info: dict[str, Any] | None,
+) -> torch.Tensor:
+    """Prefer connector-delivered codec ids over token placeholders.
+
+    In non-async full-payload mode, the scheduler only needs placeholder
+    token ids for allocation.  The real codec sequence is delivered through
+    model_intermediate_buffer as ``codes.audio``.
+    """
+    if isinstance(runtime_info, dict):
+        codes = runtime_info.get("codes")
+        if isinstance(codes, dict):
+            audio = codes.get("audio")
+            if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                return audio.reshape(-1).to(dtype=torch.long)
+            if isinstance(audio, (list, tuple)) and audio:
+                return torch.as_tensor(audio, dtype=torch.long).reshape(-1)
+    return input_ids.reshape(-1).to(dtype=torch.long)
+
+
+class _SegmentRhoTracker:
+    """Per-request rho = acoustic frames (A_k) / text tokens (n_k) accounting.
+
+    Accumulates realized codec frames and decode forwards per request and
+    logs the ratio at segment/request boundaries.  Segments are delimited by
+    the scheduler's ``is_segment_finished`` flag.
+
+    n_k is derived here, not carried per payload: the payload meta ships
+    ``request_text_tokens``, the *running* assistant text-token count of the
+    request, which covers every segment released so far because a resumable
+    request keeps one request ID across segments.  A segment's own n_k is the
+    increase of that running count between its boundary and the previous one,
+    so segment 2 is logged as A_2 / n_2 and never as A_2 / n_request.
+
+    Disabled on the non-async-chunk path, where the ramp is static.
+    """
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self._stats: dict[str, dict[str, int]] = {}
+
+    @staticmethod
+    def _new_stats() -> dict[str, int]:
+        """Fresh per-request counters: open segment plus the running base."""
+        return {
+            "seg_frames": 0,
+            "seg_forwards": 0,
+            "seg_text_tokens": 0,
+            "text_tokens_base": 0,
+        }
+
+    def observe_chunk(self, req_id: str, acoustic_frames: int, request_text_tokens: int) -> None:
+        """Accumulate one decode chunk's realized frames and running count.
+
+        ``request_text_tokens`` is the request's running text-token count as
+        carried by this payload, so only its value at the segment's last
+        payload measures the segment; max() keeps it idempotent under repeat
+        delivery of the same payload.
+        """
+        if not self.enabled or acoustic_frames <= 0:
+            return
+        stats = self._stats.setdefault(req_id, self._new_stats())
+        stats["seg_frames"] += acoustic_frames
+        stats["seg_forwards"] += 1
+        if request_text_tokens > 0:
+            stats["seg_text_tokens"] = max(stats["seg_text_tokens"], request_text_tokens)
+
+    def flush_empty_payload(
+        self,
+        runtime_infos: list[dict[str, Any]] | None,
+        request_ids: Sequence[str] | None = None,
+    ) -> None:
+        """Flush finish flags carried by payloads with no frames.
+
+        The talker adapter ends a request with an empty-finished payload, so
+        forward() returns before the boundary-cleanup loop; the flags must be
+        honored here or the trailing segment is never logged.
+
+        ``request_ids`` are the canonical scheduler-side IDs that key
+        :meth:`observe_chunk` (``requires_request_ids``).  The payload meta
+        carries the *external* request ID, which may differ, so the payload ID
+        is only a fallback for direct/dummy calls without runner IDs; keying
+        this flush on it would leave the observed segment unflushed and merge
+        two segments into one ratio.
+        """
+        if not self.enabled:
+            return
+        for index, info in enumerate(runtime_infos or []):
+            if not isinstance(info, dict):
+                continue
+            meta = info.get("meta", {})
+            if not isinstance(meta, dict):
+                continue
+            req_id = self._canonical_request_id(request_ids, index)
+            if req_id is None:
+                req_id = self._payload_request_id(meta)
+            if req_id is None:
+                continue
+            finished = bool(meta.get("finished", False))
+            segment_finished = bool(meta.get("is_segment_finished", False))
+            if finished or segment_finished:
+                self.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
+
+    @staticmethod
+    def _canonical_request_id(request_ids: Sequence[str] | None, index: int) -> str | None:
+        """Scheduler-side request ID for batch ``index``, when available."""
+        if request_ids is None or index >= len(request_ids):
+            return None
+        return str(request_ids[index])
+
+    @staticmethod
+    def _payload_request_id(meta: dict[str, Any]) -> str | None:
+        """Request ID carried by the payload meta (external ID; fallback only)."""
+        req_id = meta.get("request_id")
+        if isinstance(req_id, list):
+            req_id = req_id[0] if req_id else None
+        if req_id is None:
+            return None
+        return str(req_id)
+
+    def on_boundary(self, req_id: str, *, finished: bool, segment_finished: bool) -> None:
+        """Log and clear stats at a segment or request boundary.
+
+        A segment ending exactly at request end is logged once by the
+        request branch.
+        """
+        if not self.enabled:
+            return
+        if segment_finished and not finished:
+            self._log_segment(req_id, reset=True)
+        if finished:
+            self._log_segment(req_id, reset=False)
+            self._stats.pop(req_id, None)
+
+    def on_request_finished(self, req_id: str) -> None:
+        """Flush the trailing segment when the runner reports the request finished.
+
+        The talker adapter's final empty-finished payload may never reach
+        this stage, so the trailing segment is flushed here.
+        """
+        self.on_boundary(req_id, finished=True, segment_finished=False)
+
+    def _log_segment(self, req_id: str, *, reset: bool) -> None:
+        """Log one segment's rho, zeroing the segment counters when ``reset``.
+
+        The running text-token base survives the reset: it is what makes the
+        next boundary measure the next segment instead of the request.
+        """
+        stats = self._stats.get(req_id)
+        if stats is None or stats["seg_forwards"] == 0:
+            return
+        text_tokens = stats["seg_text_tokens"]
+        segment_text_tokens = 0
+        if text_tokens > 0:
+            # The base advances to the count observed here, so the next boundary
+            # measures the next segment. A count below the base means the
+            # payload restarted the request's text accounting for this segment
+            # (segment-local ids) instead of extending it, so the increase is
+            # not this segment's n_k and rho is logged without one.
+            segment_text_tokens = text_tokens - stats["text_tokens_base"]
+            stats["text_tokens_base"] = text_tokens
+        if segment_text_tokens > 0:
+            logger.info(
+                "Qwen3-TTS segment rho: req=%s frames=%d forwards=%d text_tokens=%d rho=%.3f",
+                req_id,
+                stats["seg_frames"],
+                stats["seg_forwards"],
+                segment_text_tokens,
+                stats["seg_frames"] / segment_text_tokens,
+            )
+        else:
+            logger.info(
+                "Qwen3-TTS segment rho: req=%s frames=%d forwards=%d text_tokens=n/a",
+                req_id,
+                stats["seg_frames"],
+                stats["seg_forwards"],
+            )
+        if reset:
+            stats["seg_frames"] = 0
+            stats["seg_forwards"] = 0
+            stats["seg_text_tokens"] = 0
+
+
+class Qwen3TTSCode2Wav(nn.Module):
+    """Stage-1 code2wav model for Qwen3-TTS (GenerationModelRunner).
+    Consumes frame-aligned codec tokens from input_ids and decodes waveform
+    via the SpeechTokenizer decoder directly (bypassing HF wrapper overhead)."""
+
+    input_modalities = "audio"
+    tokenizer_subfolder = "speech_tokenizer"
+    decoder_cudagraph_modes: tuple[str, ...] = ("icl", "xvec")
+
+    # Ask the model runner for the scheduler-side request IDs. Stateful
+    # decoder caches must use the same IDs delivered by on_requests_finished;
+    # payload metadata carries an external ID which may differ.
+    requires_request_ids = True
+    # A nonempty native codes.audio payload is authoritative; token IDs may
+    # serve only as per-request control slots for the generation scheduler.
+    supports_native_payload_input = True
+    batched_gpu_staging_keys = {("codes", "audio")}
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        self.vllm_config = vllm_config
+        self.model_path = vllm_config.model_config.model
+        self._async_chunk = bool(getattr(vllm_config.model_config, "async_chunk", False))
+
+        self.have_multimodal_outputs = True
+        self.has_preprocess = False
+        self.has_postprocess = False
+        self.enable_update_additional_information = True
+        self.requires_raw_input_tokens = True
+
+        self._decode_chunk_frames = 300
+        self._decode_left_context_frames = 25
+        self._decode_batch_max_size = 0
+        self._logged_codec_stats = False
+        self._logged_malformed_codec_lengths: set[tuple[int, int]] = set()
+        self._batch_stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._batch_stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS_LOG_EVERY", "0") or 0)
+        self._batch_stats_forwards = 0
+        self._batch_stats_groups = 0
+        self._batch_stats_requests = 0
+        self._batch_stats_padded_frames = 0
+        self._batch_stats_decoded_frames = 0
+        self._batch_stats_actual_frames: Counter[int] = Counter()
+        self._batch_stats_bucket_groups: Counter[tuple[int, int]] = Counter()
+
+        # Per-segment rho observability (#6496): realized acoustic decode
+        # steps per text token, logged at segment boundaries.
+        self._rho_stats = _SegmentRhoTracker(enabled=self._async_chunk)
+
+        # Construct decoder from config so it is visible to vLLM's
+        # memory profiler at startup.  Weights are loaded later in
+        # load_weights().
+        tok_config = Qwen3TTSTokenizerV2Config.from_pretrained(
+            self.model_path,
+            subfolder=self.tokenizer_subfolder,
+        )
+        dec_config = tok_config.decoder_config
+        self.decoder = Qwen3TTSTokenizerV2Decoder._from_config(dec_config)
+        self.decoder.eval()
+
+        self._num_quantizers = int(dec_config.num_quantizers)
+        self._output_sample_rate = int(tok_config.output_sample_rate)
+        self._total_upsample = int(self.decoder.total_upsample)
+        self._decoder_sliding_window = int(getattr(dec_config, "sliding_window", 0) or 0)
+        self._decoder_state_cache: dict[str, dict[str, Any]] = {}
+        self._decoder_state_cache_warn_entries = 512
+
+    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
+        # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
+        if input_ids.numel() == 0:
+            return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
+        return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
+
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
+        """Provide request state metadata for vLLM's external graph dummy run."""
+        return [
+            {"meta": {"request_id": f"{_DUMMY_REQUEST_ID}{index}", "finished": True}}
+            for index in range(max(0, int(num_reqs)))
+        ]
+
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
+        return None
+
+    def _split_request_ids(self, ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
+        """Split concatenated input_ids into per-request segments.
+
+        Uses seq_token_counts (injected by the runner via model_kwargs) when
+        available, falling back to forward-context ubatch_slices when
+        micro-batching is active. Returns [ids] for single-request batches.
+        """
+        if seq_token_counts is not None and len(seq_token_counts) > 1:
+            boundaries = [0]
+            for count in seq_token_counts:
+                boundaries.append(boundaries[-1] + count)
+            n = ids.numel()
+            return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
+        if is_forward_context_available():
+            slices = get_forward_context().ubatch_slices
+            if slices is not None and len(slices) > 1 and not any(hasattr(s, "token_slice") for s in slices):
+                boundaries = [0]
+                for s in slices:
+                    boundaries.append(boundaries[-1] + s)
+                return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
+        return [ids]
+
+    def _maybe_enable_decoder_cudagraph(
+        self,
+        *,
+        device: torch.device,
+        codec_chunk_frames: int,
+        codec_left_context_frames: int,
+        initial_codec_chunk_frames: int,
+        codec_chunk_ramp: list[int] | None,
+        decode_cudagraph_batch_sizes: list[int] | None,
+        decode_cudagraph_capture_sizes: list[int] | None,
+    ) -> None:
+        """Enable inner Code2Wav CUDA graph unless stage is enforce_eager."""
+        if not hasattr(self.decoder, "enable_cudagraph") or device.type != "cuda":
+            return
+
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        if getattr(model_cfg, "enforce_eager", False):
+            logger.info("Qwen3-TTS Code2Wav CUDA Graph disabled because enforce_eager is set")
+            return
+
+        if (
+            self._async_chunk
+            and codec_chunk_frames > 0
+            and codec_left_context_frames > 0
+            and self._decoder_sliding_window
+            and codec_left_context_frames < self._decoder_sliding_window
+        ):
+            logger.warning(
+                "Qwen3-TTS streaming codec_left_context_frames=%d "
+                "is smaller than decoder sliding_window=%d; "
+                "chunk-boundary distortion may occur. "
+                "Increase codec_left_context_frames to at least "
+                "%d for streaming.",
+                codec_left_context_frames,
+                self._decoder_sliding_window,
+                self._decoder_sliding_window,
+            )
+
+        self.decoder.enable_cudagraph(
+            capture_modes=self.decoder_cudagraph_modes,
+            capture_batch_sizes=decode_cudagraph_batch_sizes,
+            stateless_capture_sizes=decode_cudagraph_capture_sizes,
+            device=device,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            initial_codec_chunk_frames=initial_codec_chunk_frames,
+            codec_chunk_ramp=codec_chunk_ramp,
+            async_chunk=self._async_chunk,
+            decode_chunk_size=self._decode_chunk_frames,
+            decode_left_context=self._decode_left_context_frames,
+        )
+        logger.info("Code2Wav decoder CUDA Graph enabled")
+
+    def _record_decode_batch_stats(
+        self,
+        *,
+        group_size: int,
+        bucket_frames: int,
+        actual_frames: list[int],
+    ) -> None:
+        if not self._batch_stats_enabled:
+            return
+
+        self._batch_stats_groups += 1
+        self._batch_stats_requests += group_size
+        self._batch_stats_decoded_frames += group_size * bucket_frames
+        self._batch_stats_padded_frames += sum(bucket_frames - frames for frames in actual_frames)
+        self._batch_stats_actual_frames.update(actual_frames)
+        self._batch_stats_bucket_groups[(group_size, bucket_frames)] += 1
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for req_id in finished_req_ids:
+            self._decoder_state_cache.pop(req_id, None)
+            self._rho_stats.on_request_finished(req_id)
+
+    def log_decode_batch_stats(self) -> None:
+        if not self._batch_stats_enabled or self._batch_stats_requests == 0:
+            return
+
+        avg_group_size = self._batch_stats_requests / max(1, self._batch_stats_groups)
+        pad_ratio = self._batch_stats_padded_frames / max(1, self._batch_stats_decoded_frames)
+        logger.info(
+            "Code2Wav batch stats: forwards=%d groups=%d requests=%d "
+            "avg_group_size=%.2f padded_frames=%d decoded_frames=%d pad_ratio=%.2f%% "
+            "top_actual_frames=%s top_bucket_groups=%s",
+            self._batch_stats_forwards,
+            self._batch_stats_groups,
+            self._batch_stats_requests,
+            avg_group_size,
+            self._batch_stats_padded_frames,
+            self._batch_stats_decoded_frames,
+            100.0 * pad_ratio,
+            self._batch_stats_actual_frames.most_common(12),
+            self._batch_stats_bucket_groups.most_common(12),
+        )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
+        model_intermediate_buffer: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        """Decode codec codes into audio waveform.
+
+        input_ids layout per request: [codec_context_frames, *flat_codes]
+        where flat_codes is codebook-major [q*F].
+
+        Bypasses the HF Qwen3TTSTokenizer.decode() wrapper and calls the
+        decoder.chunked_decode() directly to avoid GPU->CPU->GPU round-trips.
+        Length management is done here instead of relying on HF's padding=-1
+        sentinel logic.
+        """
+        self._batch_stats_forwards += 1
+        decoder = self.decoder
+        q = int(self._num_quantizers)
+        sr_val = int(self._output_sample_rate)
+        sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
+        empty = torch.zeros((0,), dtype=torch.float32)
+
+        if input_ids is None or input_ids.numel() == 0:
+            self._rho_stats.flush_empty_payload(runtime_additional_information, kwargs.get("request_ids"))
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+            )
+
+        # vLLM's runner renamed this per-request side channel to
+        # ``model_intermediate_buffer``.  Keep accepting the old explicit
+        # argument for older runners, and use the new name when it is empty.
+        # Without this fallback, the non-async-chunk/full-payload path decodes
+        # placeholder input_ids instead of the codec payload from Stage 0.
+        if not runtime_additional_information:
+            runtime_additional_information = model_intermediate_buffer
+        runtime_infos = runtime_additional_information or []
+        ids = input_ids.reshape(-1).to(dtype=torch.long)
+        request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
+
+        internal_request_ids = kwargs.get("request_ids")
+        valid_codes_qf: list[tuple[str | None, torch.Tensor]] = []
+        valid_indices: list[int] = []
+        left_context_size = [0] * len(request_ids_list)
+        ref_context_size = [0] * len(request_ids_list)
+        first_audio_flags = [False] * len(request_ids_list)
+        segment_finished_flags = [False] * len(request_ids_list)
+        request_state_ids: list[str | None] = [None] * len(request_ids_list)
+        ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
+        ref_context_included = [False] * len(request_ids_list)
+        finished_flags = [False] * len(request_ids_list)
+        request_text_tokens = [0] * len(request_ids_list)
+
+        def _meta_int(value: Any) -> int:
+            if isinstance(value, list):
+                value = value[0] if value else 0
+            if isinstance(value, torch.Tensor):
+                value = value.reshape(-1)[0].item() if value.numel() > 0 else 0
+            return int(value or 0)
+
+        def _meta_str(value: Any) -> str | None:
+            if isinstance(value, list):
+                value = value[0] if value else None
+            if value is None:
+                return None
+            return str(value)
+
+        def _meta_bool(value: Any) -> bool:
+            if isinstance(value, list):
+                value = value[0] if value else False
+            if isinstance(value, torch.Tensor):
+                return bool(value.reshape(-1)[0].item()) if value.numel() > 0 else False
+            return bool(value)
+
+        if runtime_infos:
+            for i, info in enumerate(runtime_infos):
+                if i >= len(ref_context_size):
+                    break
+                if not isinstance(info, dict):
+                    continue
+                meta = info.get("meta", {})
+                first_audio_flags[i] = _meta_bool(meta.get("first_audio", False))
+                if "is_segment_finished" in meta:
+                    segment_finished_flags[i] = _meta_bool(meta["is_segment_finished"])
+                if "left_context_size" in meta:
+                    left_context_size[i] = _meta_int(meta["left_context_size"])
+                if "ref_context_size" in meta:
+                    ref_context_size[i] = _meta_int(meta["ref_context_size"])
+                if "ref_context_request_id" in meta:
+                    ref_context_request_ids[i] = _meta_str(meta["ref_context_request_id"])
+                if "request_id" in meta:
+                    request_state_ids[i] = _meta_str(meta["request_id"])
+                if "ref_context_included" in meta:
+                    ref_context_included[i] = _meta_bool(meta["ref_context_included"])
+                if "finished" in meta:
+                    finished_flags[i] = _meta_bool(meta["finished"])
+                if "request_text_tokens" in meta:
+                    request_text_tokens[i] = _meta_int(meta["request_text_tokens"])
+
+        # Normal runner calls provide scheduler-side IDs, which are also used
+        # by scheduler_output.finished_req_ids. Direct forward calls and CUDA
+        # Graph dummy runs have no runner IDs, so retain the payload ID as a
+        # fallback for those paths.
+        cache_request_ids = request_state_ids.copy()
+        if internal_request_ids is not None:
+            for i, request_id in enumerate(internal_request_ids):
+                if i >= len(cache_request_ids):
+                    break
+                cache_request_ids[i] = str(request_id)
+
+        for i, req_ids in enumerate(request_ids_list):
+            runtime_info = runtime_infos[i] if i < len(runtime_infos) else None
+            req_ids = _codec_ids_from_payload_or_input(req_ids, runtime_info)
+            if req_ids.numel() < 1:
+                continue
+            ref_ctx_frames = ref_context_size[i]
+            flat = req_ids
+            n = flat.numel()
+            if n == 0 or n % q != 0:
+                if n > 0:
+                    key = (int(n), q)
+                    if key not in self._logged_malformed_codec_lengths:
+                        self._logged_malformed_codec_lengths.add(key)
+                        logger.warning(
+                            "Code2Wav input_ids length %d not divisible by num_quantizers %d; "
+                            "skipping malformed request and suppressing repeats for this length.",
+                            n,
+                            q,
+                        )
+                continue
+            frames = n // q
+            # [q*F] -> [Q, F] for direct decoder call (decoder expects [B, Q, F])
+            codes_qf = flat.reshape(q, frames)
+            ref_req_id = ref_context_request_ids[i]
+            state_req_id = cache_request_ids[i] if self._async_chunk else None
+            is_new_state = state_req_id is not None and state_req_id not in self._decoder_state_cache
+            if is_new_state and ref_req_id is not None and ref_ctx_frames > 0:
+                if not ref_context_included[i] or frames < ref_ctx_frames:
+                    raise ValueError("Qwen3-TTS async_chunk first ICL chunk must include its declared reference prefix")
+            if state_req_id is not None and not state_req_id.startswith(_DUMMY_REQUEST_ID):
+                # A_k: codec frames produced by this segment's text; ref-context
+                # frames are the ICL speaker prefix, so exclude them.
+                self._rho_stats.observe_chunk(
+                    state_req_id,
+                    frames - (ref_context_size[i] if ref_context_included[i] else 0),
+                    request_text_tokens=request_text_tokens[i],
+                )
+            valid_codes_qf.append((state_req_id, codes_qf))
+            if state_req_id is not None:
+                state = self._decoder_state_cache.get(state_req_id)
+                if state is None:
+                    if len(self._decoder_state_cache) >= self._decoder_state_cache_warn_entries:
+                        logger.warning_once(
+                            "Qwen3-TTS decoder state cache exceeded the expected active-request envelope: "
+                            "entries=%d threshold=%d. Keeping all active states; check request cleanup paths.",
+                            len(self._decoder_state_cache),
+                            self._decoder_state_cache_warn_entries,
+                        )
+                    state = {}
+                    self._decoder_state_cache[state_req_id] = state
+                state.setdefault("skip_first_audio", first_audio_flags[i])
+                state.setdefault("prefix_frames", 0)
+                if state_req_id.startswith(_DUMMY_REQUEST_ID):
+                    state["_is_dummy_run"] = True
+                if ref_ctx_frames > 0:
+                    cached_prefix_frames = state.setdefault("prefix_frames", ref_ctx_frames)
+                    if cached_prefix_frames == 0:
+                        state["prefix_frames"] = ref_ctx_frames
+                        cached_prefix_frames = ref_ctx_frames
+                    if cached_prefix_frames != ref_ctx_frames:
+                        raise ValueError(
+                            "Qwen3-TTS ref context size changed within request "
+                            f"{ref_req_id!r}: cached={cached_prefix_frames}, current={ref_ctx_frames}"
+                        )
+            valid_indices.append(i)
+
+        num_req = len(request_ids_list)
+        if not valid_codes_qf:
+            for req_id, finished, segment_finished in zip(
+                cache_request_ids,
+                finished_flags,
+                segment_finished_flags,
+                strict=False,
+            ):
+                if req_id is not None and (finished or segment_finished):
+                    self._decoder_state_cache.pop(req_id, None)
+                    self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": [empty] * num_req,
+                    "sr": [sr_tensor] * num_req,
+                    "codec_frames": [empty.new_zeros((0, q), dtype=torch.long)] * num_req,
+                },
+            )
+
+        if not self._logged_codec_stats:
+            self._logged_codec_stats = True
+            try:
+                _, c = valid_codes_qf[0]
+                logger.info(
+                    "Code2Wav codec: frames=%d q=%d batch=%d",
+                    c.shape[1],
+                    q,
+                    len(valid_codes_qf),
+                )
+            except Exception:
+                pass
+
+        request_states: list[dict[str, Any]] | None = None
+        if self._async_chunk:
+            missing_state = [index for index, (state_req_id, _) in enumerate(valid_codes_qf) if state_req_id is None]
+            if missing_state:
+                raise ValueError(
+                    "Qwen3-TTS async_chunk Code2Wav inputs require a request_id; "
+                    f"missing state for batch indices {missing_state}"
+                )
+            request_states = [
+                self._decoder_state_cache[state_req_id]
+                for state_req_id, _ in valid_codes_qf
+                if state_req_id is not None
+            ]
+
+        request_lengths = [int(codes_qf.shape[-1]) for _, codes_qf in valid_codes_qf]
+        max_request_length = max(request_lengths)
+        request_codes_shape = (len(valid_codes_qf), q, max_request_length)
+        target_device = ids.device
+        if target_device.type == "cuda" and all(codes_qf.device.type == "cpu" for _, codes_qf in valid_codes_qf):
+            staged_codes = torch.zeros(
+                request_codes_shape,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            )
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                staged_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+            request_codes = staged_codes.to(device=target_device, non_blocking=True)
+        else:
+            request_codes = torch.zeros(request_codes_shape, dtype=torch.long, device=target_device)
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+
+        self._record_decode_batch_stats(
+            group_size=len(valid_codes_qf),
+            bucket_frames=max_request_length,
+            actual_frames=request_lengths,
+        )
+        request_wavs = decoder.batched_chunked_decode(
+            request_codes,
+            request_lengths,
+            caches=request_states,
+            chunk_size=self._decode_chunk_frames,
+            left_context_size=self._decode_left_context_frames,
+            max_batch_size=self._decode_batch_max_size,
+        )
+        if len(request_wavs) != len(valid_codes_qf):
+            raise ValueError(
+                f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"
+            )
+        wav_tensors: list[torch.Tensor] = []
+        for row in range(len(valid_codes_qf)):
+            wav = request_wavs[row]
+            if wav.dim() == 2 and wav.shape[0] == 1:
+                wav = wav[0]
+            elif wav.dim() != 1:
+                raise ValueError(f"Qwen3-TTS batched decoder returned unexpected row shape {tuple(wav.shape)}")
+            if request_states is None:
+                start = left_context_size[valid_indices[row]] * self._total_upsample
+                wav = wav[start:]
+            wav_tensors.append(wav)
+
+        if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
+            self.log_decode_batch_stats()
+
+        first_audio_required = [torch.tensor(False)] * num_req
+        if request_states is not None:
+            for row, idx in enumerate(valid_indices):
+                first_audio_required[idx] = torch.tensor(bool(request_states[row].get("skip_first_audio", False)))
+        audios: list[torch.Tensor] = [empty] * num_req
+        srs = [sr_tensor] * num_req
+        codes_out: list[torch.Tensor] = [empty.new_zeros((0, q), dtype=torch.long)] * num_req
+        for row, (_, codes_qf) in enumerate(valid_codes_qf):
+            start = 0 if request_states is not None else left_context_size[valid_indices[row]]
+            codes_out[valid_indices[row]] = codes_qf[:, start:].transpose(0, 1).to(torch.long)
+
+        for j, idx in enumerate(valid_indices):
+            wav = wav_tensors[j]
+            assert wav is not None
+            if wav.numel() == 0:
+                continue
+            if wav.shape[0] > 0:
+                # Return FP32 audio regardless of the decoder compute dtype.
+                audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
+
+        for req_id, finished, segment_finished in zip(
+            cache_request_ids,
+            finished_flags,
+            segment_finished_flags,
+            strict=False,
+        ):
+            if req_id is not None and (finished or segment_finished):
+                self._decoder_state_cache.pop(req_id, None)
+                self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
+
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={
+                "model_outputs": audios,
+                "sr": srs,
+                FIRST_AUDIO_REQUIRED_KEY: first_audio_required,
+                "codec_frames": codes_out,
+            },
+        )
+
+    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
+        if isinstance(model_outputs, OmniOutput):
+            return model_outputs
+
+        if isinstance(model_outputs, tuple) and len(model_outputs) == len(OmniOutput._fields):
+            return OmniOutput(*model_outputs)
+
+        if not (isinstance(model_outputs, tuple) and len(model_outputs) == 2):
+            raise TypeError(
+                "Qwen3TTSCode2Wav expected OmniOutput, OmniOutput tuple, "
+                f"or (audio_tensor, sr) outputs, got {type(model_outputs)}"
+            )
+
+        audio_tensor, sr = model_outputs
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={
+                "model_outputs": audio_tensor,
+                "sr": sr,
+            },
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The primary weights iterator contains no Code2Wav parameters.
+        # Drain it so callers don't hang on an unconsumed generator.
+        for _ in weights:
+            pass
+
+        # Load decoder weights from the speech_tokenizer/ subfolder
+        # via vLLM's weight loader (handles sharded safetensors, index
+        # files, and all load formats).  AutoWeightsLoader matches
+        # "decoder.*" weights to self.decoder and skips encoder weights.
+        model_loader = DefaultModelLoader(self.vllm_config.load_config)
+        source = DefaultModelLoader.Source(
+            model_or_path=self.model_path,
+            revision=self.vllm_config.model_config.revision,
+            subfolder=self.tokenizer_subfolder,
+        )
+        subfolder_weights = model_loader._get_weights_iterator(source)
+        loaded = AutoWeightsLoader(self).load_weights(
+            subfolder_weights, mapper=WeightsMapper(orig_to_new_prefix={"encoder.": None})
+        )
+
+        device = self.vllm_config.device_config.device
+        self.decoder.to(device=device, dtype=self.vllm_config.model_config.dtype)
+
+        # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
+        if hasattr(self.decoder, "precompute_snake_caches"):
+            self.decoder.precompute_snake_caches()
+
+        # The connector codec chunk settings control inter-stage streaming
+        # windows. Keep decoder-internal chunking separate; using the small
+        # streaming window here causes repeated overlap decode in Code2Wav.
+        codec_chunk_frames = 0
+        codec_left_context_frames = 0
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        extra_cfg = (
+            connector_cfg.get("extra", connector_cfg)
+            if isinstance(connector_cfg, dict)
+            else getattr(connector_cfg, "extra", None)
+        )
+
+        def _get_int_config(name: str, default: int) -> int:
+            value = extra_cfg.get(name, default)
+            if value is None:
+                return default
+            try:
+                return int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+
+        def _get_bool_config(name: str, default: bool) -> bool:
+            value = extra_cfg.get(name, default)
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in ("1", "true", "yes", "on"):
+                    return True
+                if lowered in ("0", "false", "no", "off"):
+                    return False
+            if isinstance(value, int):
+                return bool(value)
+            raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
+
+        def _get_int_list_config(name: str) -> list[int] | None:
+            value = extra_cfg.get(name)
+            if value is None:
+                return None
+            if isinstance(value, str):
+                raw_values = [item.strip() for item in value.split(",") if item.strip()]
+            elif isinstance(value, int):
+                raw_values = [value]
+            else:
+                try:
+                    raw_values = list(value)
+                except TypeError as exc:
+                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+            values: set[int] = set()
+            for item in raw_values:
+                try:
+                    parsed = int(item)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+                if parsed > 0:
+                    values.add(parsed)
+            return sorted(values)
+
+        def _get_int_pair_list_config(name: str) -> list[tuple[int, int]] | None:
+            value = extra_cfg.get(name)
+            if value is None:
+                return None
+            if isinstance(value, str):
+                raw_values = [item.strip() for item in value.split(",") if item.strip()]
+            else:
+                try:
+                    raw_values = list(value)
+                except TypeError as exc:
+                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+
+            pairs: set[tuple[int, int]] = set()
+            for item in raw_values:
+                if isinstance(item, str):
+                    if ":" not in item:
+                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
+                    left, right = item.split(":", 1)
+                    raw_pair = (left.strip(), right.strip())
+                else:
+                    try:
+                        raw_pair = tuple(item)
+                    except TypeError as exc:
+                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+                    if len(raw_pair) != 2:
+                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
+                try:
+                    batch_size = int(raw_pair[0])
+                    seq_len = int(raw_pair[1])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+                if batch_size > 0 and seq_len > 0:
+                    pairs.add((batch_size, seq_len))
+            return sorted(pairs)
+
+        if isinstance(extra_cfg, dict):
+            codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
+            codec_left_context_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+            initial_codec_chunk_frames = int(extra_cfg.get("initial_codec_chunk_frames") or 1)
+            codec_chunk_ramp = parse_chunk_ramp(extra_cfg, steady=codec_chunk_frames) if self._async_chunk else None
+            decode_chunk_frames = _get_int_config("decode_chunk_frames", self._decode_chunk_frames)
+            decode_left_context_frames = _get_int_config(
+                "decode_left_context_frames",
+                self._decode_left_context_frames,
+            )
+            if decode_chunk_frames <= 0 or decode_left_context_frames < 0:
+                raise ValueError(
+                    "Invalid Qwen3-TTS Code2Wav decode chunk config: "
+                    f"decode_chunk_frames={decode_chunk_frames}, "
+                    f"decode_left_context_frames={decode_left_context_frames}"
+                )
+            self._decode_chunk_frames = decode_chunk_frames
+            self._decode_left_context_frames = decode_left_context_frames
+            decode_cudagraph_batch_sizes = _get_int_list_config("decode_cudagraph_batch_sizes")
+            decode_cudagraph_capture_sizes = (
+                None if self._async_chunk else _get_int_list_config("decode_cudagraph_capture_sizes")
+            )
+            decode_batch_max_size = _get_int_config("decode_batch_max_size", self._decode_batch_max_size)
+            if decode_batch_max_size < 0:
+                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch_max_size}")
+            self._decode_batch_max_size = decode_batch_max_size
+            decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
+            decode_time_major_conv = _get_bool_config("decode_time_major_conv", False)
+            self.decoder.capture_first_audio_state_only = self._async_chunk and _get_bool_config(
+                "talker_first_audio", False
+            )
+            decode_cudnn_benchmark = _get_bool_config("decode_cudnn_benchmark", False)
+        else:
+            codec_chunk_frames = 0
+            codec_left_context_frames = 0
+            initial_codec_chunk_frames = 1
+            codec_chunk_ramp = None
+            decode_cudagraph_batch_sizes = None
+            decode_cudagraph_capture_sizes = None
+            decode_enable_tf32 = False
+            decode_cudnn_benchmark = False
+            decode_time_major_conv = False
+
+        if decode_enable_tf32 and device.type == "cuda":
+            # PyTorch exposes TF32 controls as process-wide CUDA backend
+            # switches. This opt-in is intended for deployments where
+            # Code2Wav runs in its own Stage1 worker process.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            logger.info(
+                "Qwen3-TTS Code2Wav TF32 enabled process-wide: "
+                "matmul.allow_tf32=%s cudnn.allow_tf32=%s float32_matmul_precision=%s",
+                torch.backends.cuda.matmul.allow_tf32,
+                torch.backends.cudnn.allow_tf32,
+                torch.get_float32_matmul_precision(),
+            )
+
+        if decode_time_major_conv and device.type == "cuda":
+            self.decoder.enable_time_major_conv()
+
+        self.decoder._initial_codec_chunk_frames = initial_codec_chunk_frames
+        self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
+        self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
+
+        if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
+            try:
+                # Autotune only during warmup/capture, then restore the process
+                # flags. The captured convolution algorithms remain in the
+                # graphs without changing later models' cuDNN policy.
+                autotune = (
+                    torch.backends.cudnn.flags(
+                        enabled=torch.backends.cudnn.enabled,
+                        benchmark=True,
+                        benchmark_limit=10,
+                        deterministic=torch.backends.cudnn.deterministic,
+                        allow_tf32=torch.backends.cudnn.allow_tf32,
+                    )
+                    if decode_cudnn_benchmark
+                    else nullcontext()
+                )
+                with autotune:
+                    self._maybe_enable_decoder_cudagraph(
+                        device=device,
+                        codec_chunk_frames=codec_chunk_frames,
+                        codec_left_context_frames=codec_left_context_frames,
+                        initial_codec_chunk_frames=initial_codec_chunk_frames,
+                        codec_chunk_ramp=codec_chunk_ramp,
+                        decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
+                        decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to enable CUDA Graph for Code2Wav decoder",
+                    exc_info=True,
+                )
+
+        return loaded
