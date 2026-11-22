@@ -31,7 +31,7 @@ class PartitionTests(unittest.TestCase):
             ("final_layer.weight", 3),
             ("token_refiner.blocks.0.weight", 4),
         ]
-        self.assertEqual(list(local_weights(weights, 1, 3)), weights[1:])
+        self.assertEqual(list(local_weights(weights, 1, 3, include_io=True)), weights[1:])
 
     def test_single_rank(self):
         blocks = build_stage_blocks(2, 0, 2, AffineBlock)
@@ -39,6 +39,20 @@ class PartitionTests(unittest.TestCase):
         for block in blocks:
             hidden = block(hidden)
         self.assertEqual(hidden.item(), 5.0)
+
+    def test_suffix_filters_io_weights_in_both_checkpoint_formats(self):
+        for prefix in ("blocks", "transformer_blocks"):
+            weights = [
+                (f"{prefix}.0.attn.weight", 0),
+                (f"{prefix}.1.attn.weight", 1),
+                (f"{prefix}.2.attn.weight", 2),
+                ("final_layer.weight", 3),
+                ("proj_in.weight", 4),
+                ("token_refiner.blocks.0.weight", 5),
+                ("rope.inv_freq", 6),
+            ]
+            with self.subTest(prefix=prefix):
+                self.assertEqual(list(local_weights(weights, 1, 3, include_io=False)), weights[1:3])
 
 
 if __name__ == "__main__":

@@ -1,72 +1,62 @@
 # MonoWire
 
-Pipeline-parallel inference for the original MiniMax H3 model, built on vLLM-Omni Diffusion. Supports continuous request scheduling, cache-aware batching, and FirstBlockCache pipeline bypass.
+Pipeline-parallel inference for the original MiniMax H3, built on vLLM-Omni Diffusion. Supports continuous batching, replicated ingress stages, and FirstBlockCache / FirstStageCache bypass.
 
 ## Installation
 
-Run the following commands on the GPU server from the repository root. Use Python 3.12 and a CUDA environment compatible with the pinned vLLM runtime. Local source editing does not require installing this GPU runtime.
+Install on the GPU server with Python 3.12. Runtime versions are pinned in [runtime.lock.json](runtime.lock.json); the vLLM-Omni source is included in `third_party/vllm-omni`.
 
 ```bash
 python3.12 -m venv .venv-omni
 source .venv-omni/bin/activate
 python -m pip install --upgrade pip
-```
-
-The vLLM-Omni source is included in `third_party/vllm-omni`, with the H3 integration already applied. Install this source directly. Its upstream revision and required runtime versions are recorded in `runtime.lock.json`.
-
-The pinned runtime uses the prebuilt **vLLM 0.32.0 / PyTorch 2.13.0 / CUDA 12.9** packages. No vLLM compilation is needed:
-
-```bash
 python -m pip install "vllm==0.32.0+cu129" "torch==2.13.0+cu129" \
   --extra-index-url https://wheels.vllm.ai/0.32.0/cu129 \
   --extra-index-url https://download.pytorch.org/whl/cu129
 VLLM_OMNI_TARGET_DEVICE=cuda python -m pip install -e third_party/vllm-omni
 python -m pip install -e .
 python -m pip check
-monowire --help
 ```
-
-MonoWire targets the bundled vLLM-Omni **v0.32.0** source and its native H3 step interfaces. Use the versions in `runtime.lock.json`.
 
 ## Usage
 
-Use the original H3 native **FL2VA** checkpoint. Replace `/path/to/FL2VA` below with its directory. The native VAE requires `--trust-remote-code`.
-
-### Continuous inference with FirstBlockCache
-
-Launch one process per pipeline stage. This example uses eight GPUs:
+Run on eight GPUs with the original H3 native FL2VA checkpoint:
 
 ```bash
 torchrun --standalone --nproc-per-node=8 -m monowire.cli \
-  --pp 8 \
-  --model /path/to/FL2VA \
+  --pp 8 --model /path/to/FL2VA \
   --prompt "A cat walks along a beach." \
   --prompt "A dog runs through a field." \
-  --batch-size 32 --microbatch-size 8 \
-  --cache first_block --max-batch-wait-ms 2 \
+  --batch-size 32 --microbatch-size 8 --downstream-batch-size 8 \
+  --cache first_stage --cache-max-skip 2 \
   --height 384 --width 672 --aspect-ratio 16:9 \
   --frames 124 --steps 20 --seed 42 \
   --cpu-offload --trust-remote-code \
   --output outputs/results.pt
 ```
 
-Repeat `--prompt` to submit more requests. Requests advance independently and are grouped by cache status and input compatibility. Completed requests leave the active set so waiting requests can enter.
+Repeat `--prompt` to add requests. The native VAE requires `--trust-remote-code`. Results are saved with `torch.save` as request IDs, video/audio outputs, and errors.
 
 | Option | Meaning |
 | --- | --- |
-| `--pp` | Number of pipeline stages; must match the process count. |
-| `--batch-size` | Maximum number of active requests. |
-| `--microbatch-size` | Maximum requests per physical batch; must not exceed `--batch-size`. |
-| `--max-batch-wait-ms` | Waiting limit before dispatching a partial ready batch. |
-| `--cache` | Accepts `none` or `first_block`. |
-| `--cache-threshold` | Cache reuse threshold; defaults to `0.17`. |
-| `--cache-warmup` | Initial steps without reuse; defaults to `2`. |
-| `--cache-max-skip` | Maximum consecutive cache hits; defaults to `2`. |
+| `--pp` | Total GPU workers; must match the process count. |
+| `--batch-size` | Maximum active requests per ingress replica. |
+| `--microbatch-size` | Maximum requests per ingress forward. |
+| `--downstream-batch-size` | Maximum requests per suffix forward. |
+| `--cache` | `none` (default), `first_block`, `first_stage`, or `first_stage_periodic`. |
+| `--cache-threshold` | Reuse threshold; defaults to `0.17`. |
+| `--cache-max-skip` | Maximum consecutive reuse steps; defaults to `2`. |
 
-Use `--cache none` for uncached inference. Continuous execution currently supports dense H3 text-to-audio/video inference with Euler sampling and pure pipeline parallelism.
+`first_block` and `first_stage` compare prefix residuals with the last full evaluation. `first_stage_periodic` compares adjacent steps. Cache hits finish the step at ingress; misses enter the shared suffix. Batch sizes are upper limits, so batches may be partial. Use `--cache none` to disable reuse and calibrate thresholds against output quality.
 
-### Outputs and Python integration
+For two ingress replicas and six suffix GPUs, add:
 
-The CLI saves results with `torch.save`; it does not write MP4 files. The CLI writes on rank 0 only, saving a list of dictionaries containing `request_id`, the native video/audio `output`, and any `error`.
+```bash
+--ingress-replicas 2 --stage-layers 6 7 7 7 7 8 8
+```
 
-For Python applications, import `create_continuous_engine`, `ContinuousConfig`, and `CacheConfig` from `monowire`. Use `engine.generate(prompts, sampling_params)` for a finite batch or `engine.stream(async_request_source)` for live arrivals. The source yields `(request_id, prompt, sampling_params)` tuples. All pipeline ranks must enter the same service lifecycle; only rank 0 consumes requests and emits results.
+The first six blocks are replicated on GPUs 0 and 1; the remaining 44 blocks run on GPUs 2–7. Active and ingress batch limits apply to each replica. Outputs use separate `.rank0.pt` and `.rank1.pt` files.
+
+For Python, import `create_continuous_engine`, `ContinuousConfig`, `CacheConfig`, and `PipelineTopology` from `monowire`. Use `engine.generate(prompts, sampling_params)` for a finite request list or `engine.stream(source)` for an async source yielding `(request_id, prompt, sampling_params)`. All ranks must participate; `generate` shards the common list across ingress replicas, while `stream` accepts a separate source on each ingress. Close an unfinished stream with `aclose()` before closing the engine.
+
+The current H3 adapter supports dense text-to-audio/video inference with Euler sampling. Run `monowire --help` for all options.

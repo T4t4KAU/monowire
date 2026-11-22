@@ -1,7 +1,6 @@
 """Continuous H3 pipeline inference; launch one worker per GPU with torchrun."""
 
 import argparse
-import sys
 from pathlib import Path
 
 
@@ -12,7 +11,9 @@ def main():
         "--prompt", action="append", required=True, help="Repeat for multiple requests"
     )
     parser.add_argument("--pp", type=int, default=8)
-    parser.add_argument("--max-batch-wait-ms", type=float, default=2.0)
+    parser.add_argument("--ingress-replicas", type=int, default=1)
+    parser.add_argument("--stage-layers", type=int, nargs="+")
+    parser.add_argument("--downstream-batch-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=1, help="Maximum concurrent requests")
     parser.add_argument(
         "--microbatch-size",
@@ -20,10 +21,21 @@ def main():
         default=1,
         help="Requests per physical block forward",
     )
-    parser.add_argument("--cache", choices=("none", "first_block"), default="none")
+    parser.add_argument(
+        "--cache",
+        choices=("none", "first_block", "first_stage", "first_stage_periodic"),
+        default="none",
+    )
     parser.add_argument("--cache-threshold", type=float, default=0.17)
     parser.add_argument("--cache-warmup", type=int, default=2)
     parser.add_argument("--cache-max-skip", type=int, default=2)
+    parser.add_argument(
+        "--cache-probe-blocks",
+        type=int,
+        nargs="+",
+        default=(),
+        help="One-based ingress block indices; use the maximum relative residual change",
+    )
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--width", type=int, default=768)
     parser.add_argument(
@@ -38,10 +50,6 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
-    if sys.version_info < (3, 11):
-        parser.error(
-            "The pinned vLLM-Omni requires Python >=3.11; use an isolated Omni environment"
-        )
     if args.pp < 1:
         parser.error("--pp must be positive")
     import torch
@@ -49,12 +57,32 @@ def main():
     from .cache import CacheConfig
     from .continuous import ContinuousConfig
     from .models.h3.runtime import create_continuous_engine
+    from .topology import PipelineTopology
+
+    if args.ingress_replicas != 1 and not args.stage_layers:
+        parser.error("--ingress-replicas requires explicit --stage-layers")
+    topology = (
+        PipelineTopology(tuple(args.stage_layers), args.ingress_replicas)
+        if args.stage_layers
+        else None
+    )
 
     engine = create_continuous_engine(
         args.model,
         pp_size=args.pp,
-        config=ContinuousConfig(args.batch_size, args.microbatch_size, args.max_batch_wait_ms),
-        cache=CacheConfig(args.cache, args.cache_threshold, args.cache_warmup, args.cache_max_skip),
+        topology=topology,
+        config=ContinuousConfig(
+            max_active_requests=args.batch_size,
+            microbatch_size=args.microbatch_size,
+            downstream_batch_size=args.downstream_batch_size,
+        ),
+        cache=CacheConfig(
+            args.cache,
+            args.cache_threshold,
+            args.cache_warmup,
+            args.cache_max_skip,
+            probe_blocks=tuple(args.cache_probe_blocks),
+        ),
         cpu_offload=args.cpu_offload,
         trust_remote_code=args.trust_remote_code,
     )
@@ -74,7 +102,7 @@ def main():
                 ),
             )
         )
-        if engine.rank != 0:
+        if not engine.is_ingress:
             return
         outputs = [
             {
@@ -85,6 +113,8 @@ def main():
             for item in outputs
         ]
         destination = Path(args.output)
+        if engine.ingress_replicas > 1:
+            destination = destination.with_stem(f"{destination.stem}.rank{engine.rank}")
         destination.parent.mkdir(parents=True, exist_ok=True)
         torch.save(outputs, destination)
     finally:

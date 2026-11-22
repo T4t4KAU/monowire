@@ -1288,6 +1288,7 @@ class MiniMaxH3DiTModel(nn.Module):
         *,
         diffusers_weights: bool | None = None,
         attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
+        load_io_modules: bool = True,
     ) -> None:
         super().__init__()
         tf_config = od_config.tf_model_config
@@ -1365,54 +1366,57 @@ class MiniMaxH3DiTModel(nn.Module):
                 f"{ulysses_degree} != 0"
             )
 
-        self.video_patch_proj = ColumnParallelLinear(
-            arch.latents_dim * arch.patch_size[0] * arch.patch_size[1] * arch.patch_size[2],
-            arch.hidden_size,
-            bias=True,
-            gather_output=True,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix="video_patch_proj",
-        )
-        self.audio_patch_proj = ColumnParallelLinear(
-            arch.audio_latents_dim,
-            arch.hidden_size,
-            bias=True,
-            gather_output=True,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix="audio_patch_proj",
-        )
-        self.condition_proj = ColumnParallelLinear(
-            arch.text_dim,
-            arch.hidden_size,
-            bias=True,
-            gather_output=True,
-            params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
-            prefix="condition_proj",
-        )
-        self.time_embedder = MiniMaxH3TimeEmbedder(
-            arch,
-            prefix="time_embedder",
-        )
-        self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
-        self.token_refiner = MiniMaxH3TokenRefiner(
-            arch,
-            quant_config,
-            prefix="token_refiner",
-        )
+        # Block-only stages consume prepared embeddings and return hidden rows.
+        if load_io_modules:
+            self.video_patch_proj = ColumnParallelLinear(
+                arch.latents_dim * arch.patch_size[0] * arch.patch_size[1] * arch.patch_size[2],
+                arch.hidden_size,
+                bias=True,
+                gather_output=True,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix="video_patch_proj",
+            )
+            self.audio_patch_proj = ColumnParallelLinear(
+                arch.audio_latents_dim,
+                arch.hidden_size,
+                bias=True,
+                gather_output=True,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix="audio_patch_proj",
+            )
+            self.condition_proj = ColumnParallelLinear(
+                arch.text_dim,
+                arch.hidden_size,
+                bias=True,
+                gather_output=True,
+                params_dtype=_BF16_DTYPE,
+                quant_config=quant_config,
+                prefix="condition_proj",
+            )
+            self.time_embedder = MiniMaxH3TimeEmbedder(
+                arch,
+                prefix="time_embedder",
+            )
+            self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
+            self.token_refiner = MiniMaxH3TokenRefiner(
+                arch,
+                quant_config,
+                prefix="token_refiner",
+            )
         self.blocks = self.build_transformer_blocks(arch, quant_config, attention_cls)
-        self.sp_prepare = MiniMaxH3SPPrepare()
-        self.local_sp_prepare = MiniMaxH3SPPrepare()
-        self.sp_gather = MiniMaxH3SPGather()
+        if load_io_modules:
+            self.sp_prepare = MiniMaxH3SPPrepare()
+            self.local_sp_prepare = MiniMaxH3SPPrepare()
+            self.sp_gather = MiniMaxH3SPGather()
+            self.final_layer = MiniMaxH3FinalLayer(
+                arch,
+                quant_config,
+                prefix="final_layer",
+                adaln_cache=self.adaln_cache,
+            )
         self.vsa_gates_enabled = False
-        self.final_layer = MiniMaxH3FinalLayer(
-            arch,
-            quant_config,
-            prefix="final_layer",
-            adaln_cache=self.adaln_cache,
-        )
         self._mark_missing_params_required()
 
     def build_transformer_blocks(self, arch, quant_config, attention_cls):
@@ -1602,15 +1606,16 @@ class MiniMaxH3DiTModel(nn.Module):
             for name, parts in qkv_parts.items():
                 if parts != {"q", "k", "v"}:
                     raise ValueError(f"incomplete Diffusers H3 QKV group {name}: {sorted(parts)}")
-            # Diffusers reconstructs RoPE from config instead of storing this
-            # native checkpoint buffer. Compute on CPU for identical values.
-            freq_dim = self.arch.rope_inv_freq_len
-            rope = 1.0 / (
-                self._rope_theta
-                ** (torch.arange(0, 2 * freq_dim, 2, dtype=torch.float32, device="cpu") / (2 * freq_dim))
-            )
-            default_weight_loader(params["rope.inv_freq"], rope)
-            loaded.add("rope.inv_freq")
+            if "rope.inv_freq" in params:
+                # Diffusers reconstructs RoPE from config instead of storing this
+                # native checkpoint buffer. Compute on CPU for identical values.
+                freq_dim = self.arch.rope_inv_freq_len
+                rope = 1.0 / (
+                    self._rope_theta
+                    ** (torch.arange(0, 2 * freq_dim, 2, dtype=torch.float32, device="cpu") / (2 * freq_dim))
+                )
+                default_weight_loader(params["rope.inv_freq"], rope)
+                loaded.add("rope.inv_freq")
         return loaded
 
     @staticmethod

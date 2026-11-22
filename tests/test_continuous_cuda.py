@@ -10,8 +10,10 @@ from types import SimpleNamespace
 import torch
 import torch.multiprocessing as mp
 
+from monowire.channels import close_channels, create_channels
 from monowire.continuous import PreparedStep
 from monowire.models.h3.adapter import H3StageAdapter
+from monowire.topology import PipelineTopology
 from monowire.transport import PipelineExecutor, serve_stage
 
 
@@ -68,18 +70,21 @@ def worker(rank, size, store):
                 hidden=hidden,
                 arguments=args,
                 transformer=transformer,
-                first_done=False,
+                next_layer=0,
                 entry=SimpleNamespace(residual=torch.ones_like(hidden) * 10),
             ),
         )
 
+    topology = PipelineTopology((1,) * size)
+    channels = create_channels(topology, f"cuda:{rank}")
+
     async def run():
-        executor = PipelineExecutor(H3StageAdapter(transformer))
+        executor = PipelineExecutor(H3StageAdapter(transformer), topology, channels)
         tasks = [
-            asyncio.create_task(executor.execute([prepared(f"{i}a", i), prepared(f"{i}b", i + 1)]))
+            asyncio.gather(*executor.submit([prepared(f"{i}a", i), prepared(f"{i}b", i + 1)]))
             for i in range(4)
         ]
-        hit = await executor.execute([prepared("hit", 100, True)])
+        hit = await asyncio.gather(*executor.submit([prepared("hit", 100, True)]))
         torch.testing.assert_close(hit[0], torch.full_like(hit[0], 110))
         for i, task in enumerate(tasks):
             outputs = await asyncio.wait_for(task, 60)
@@ -94,8 +99,9 @@ def worker(rank, size, store):
             if rank == 0:
                 asyncio.run(run())
             else:
-                serve_stage(H3StageAdapter(transformer))
+                serve_stage(H3StageAdapter(transformer), topology, channels, batch_size=8)
     finally:
+        close_channels(channels)
         destroy_model_parallel()
         destroy_distributed_environment()
 

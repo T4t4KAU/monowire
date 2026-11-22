@@ -1,5 +1,7 @@
 """Native vLLM-Omni H3 integration, using its loader, workers and PP group."""
 
+from contextlib import contextmanager
+
 from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
@@ -11,9 +13,12 @@ from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
     MiniMaxH3Pipeline,
     get_minimax_h3_post_process_func,
 )
+from vllm_omni.diffusion.models.minimax_h3.vae import _VideoVAEPartProxy
 
 from ...cache import CacheConfig, RequestCache
 from ...partition import build_stage_blocks, local_weights
+from ...topology import PipelineTopology
+from .io import CodecOffloader
 
 logger = init_logger("monowire")
 
@@ -25,18 +30,30 @@ class MonoWireH3Transformer(MiniMaxH3DiTModel):
     def __init__(self, od_config, quant_config=None, **kwargs):
         if quant_config is not None:
             raise ValueError("Initial H3 PP integration requires unquantized original weights")
-        super().__init__(od_config, quant_config=quant_config, **kwargs)
+        self.pp_group = get_pp_group()
+        topology = od_config.cache_config.monowire_topology
+        self.topology = PipelineTopology(**topology) if topology is not None else None
+        replicas = self.topology.ingress_replicas if self.topology is not None else 1
+        self.is_ingress = self.pp_group.rank_in_group < replicas
+        super().__init__(
+            od_config, quant_config=quant_config, load_io_modules=self.is_ingress, **kwargs
+        )
         options = od_config.cache_config.monowire
         config = CacheConfig(**options)
         self.request_cache = RequestCache(config, od_config.max_num_seqs)
 
     def build_transformer_blocks(self, arch, quant_config, attention_cls):
-        self.pp_group = get_pp_group()
-        self.start_layer, self.end_layer = get_pp_indices(
-            arch.num_layers,
-            self.pp_group.rank_in_group,
-            self.pp_group.world_size,
-        )
+        if self.topology is None:
+            ranges = [
+                get_pp_indices(arch.num_layers, rank, self.pp_group.world_size)
+                for rank in range(self.pp_group.world_size)
+            ]
+            self.topology = PipelineTopology(tuple(end - start for start, end in ranges))
+        if sum(self.topology.stage_layers) != arch.num_layers:
+            raise ValueError("Topology must cover every transformer block exactly once")
+        if self.topology.world_size != self.pp_group.world_size:
+            raise ValueError("Topology does not match the distributed world")
+        self.start_layer, self.end_layer = self.topology.layer_range(self.pp_group.rank_in_group)
 
         logger.info(
             "MonoWire H3 PP rank %d/%d owns blocks [%d, %d) of %d",
@@ -67,7 +84,9 @@ class MonoWireH3Transformer(MiniMaxH3DiTModel):
         raise RuntimeError("Use the continuous H3 request adapter to execute pipeline stages")
 
     def load_weights(self, weights):
-        return super().load_weights(local_weights(weights, self.start_layer, self.end_layer))
+        return super().load_weights(
+            local_weights(weights, self.start_layer, self.end_layer, include_io=self.is_ingress)
+        )
 
 
 class MonoWireH3Pipeline(MiniMaxH3Pipeline):
@@ -97,23 +116,60 @@ class MonoWireH3Pipeline(MiniMaxH3Pipeline):
                 "Use MonoWire CacheConfig; upstream global cache hooks are not request-isolated"
             )
         super().__init__(od_config=od_config, prefix=prefix)
+        self._codec_offloader = None
 
-    def post_decode(self, state, **kwargs):
-        from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-            _STEP_TRANSFORMER,
-        )
+    def _io_rank_world(self):
+        """Each ingress owns its codecs; DiT ranks never join codec collectives."""
+        return None, 0, 1
 
-        transformer = state.extra[_STEP_TRANSFORMER]
-        try:
-            return super().post_decode(state, **kwargs)
-        finally:
-            entry = transformer.request_cache.entries.pop(state.request_id, None)
-            if entry is not None:
-                logger.info(
-                    "MonoWire cache request=%s rank=%d policy=%s hits=%d computes=%d",
-                    state.request_id,
-                    transformer.pp_group.rank_in_group,
-                    transformer.request_cache.config.policy,
-                    entry.hits,
-                    entry.computes,
-                )
+    @staticmethod
+    def _is_output_owner_rank():
+        return True
+
+    def enable_omni_model_cpu_offload(
+        self, *, device, pin_memory, use_hsdp, offload_components=None
+    ):
+        """Offload codec components only; in-flight DiT weights stay resident."""
+        from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+        if use_hsdp:
+            raise ValueError("Codec offload does not support HSDP")
+        if offload_components is not None:
+            raise ValueError("MonoWire manages codec offload as a single I/O lifecycle")
+        if self._codec_offloader is not None:
+            raise RuntimeError("Codec offload is already enabled")
+        components = ModuleDiscovery.discover(self)
+        stages = [*components.encoders, *components.vaes]
+        if self.latent_upscaler is not None:
+            stages.append(self.latent_upscaler)
+        self._codec_offloader = CodecOffloader(stages, device, pin_memory=pin_memory)
+
+    def disable_omni_model_cpu_offload(self):
+        if self._codec_offloader is not None and self._codec_offloader.active is not None:
+            raise RuntimeError("Drain codec work before disabling offload")
+        self._codec_offloader = None
+
+    @contextmanager
+    def _component_on_device(self, component):
+        if self._codec_offloader is None:
+            with super()._component_on_device(component):
+                yield
+            return
+        if isinstance(component, _VideoVAEPartProxy):
+            component = component.sequential_offload_target
+        with self._codec_offloader.activate(component):
+            yield
+
+    def _encode_text_hidden(self, input_ids, vision_kwargs):
+        if self._codec_offloader is None:
+            return super()._encode_text_hidden(input_ids, vision_kwargs)
+        with self._component_on_device(self.text_encoder):
+            return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
+
+    def _offload_model_cpu_stage_output(self, tensor):
+        return tensor.cpu() if self._codec_offloader is not None else tensor
+
+    def _release_stage_cache(self):
+        # Other requests still own live DiT work. Do not flush the device
+        # allocator at a per-request codec boundary.
+        return

@@ -1,11 +1,11 @@
 """Native H3 request state and stage operations for continuous serving."""
 
-from contextlib import contextmanager
-
 import torch
 
+from ...channels import record_stream
 from ...continuous import PreparedStep
-from .packing import pack_block_kwargs, validate_block_kwargs
+from .io import CodecWorker
+from .packing import pack_requests, validate_block_kwargs
 
 
 class H3RequestAdapter:
@@ -13,26 +13,10 @@ class H3RequestAdapter:
 
     def __init__(self, pipeline):
         self.pipeline = pipeline
+        self.io = CodecWorker(pipeline.device)
 
-    @contextmanager
-    def _local_io(self):
-        # The pinned native pipeline normally distributes encoder inputs across
-        # its DiT world. Actor workers only own blocks and never enter that
-        # collective. Scope request I/O to its single owner, without changing
-        # the PP group used by the actor transport. All adapter calls are on
-        # one event-loop thread; other ranks are separate OS processes.
+    async def admit(self, key, value):
         from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
-
-        if self.pipeline.text_encoder_tp_size != 1:
-            raise ValueError("Continuous ingress requires a single-rank text encoder")
-        original = native._dit_rank_world
-        native._dit_rank_world = lambda: (None, 0, 1)
-        try:
-            yield
-        finally:
-            native._dit_rank_world = original
-
-    def admit(self, key, value):
         from vllm_omni.diffusion.worker.utils import StepRequestState
 
         prompt, sampling = value
@@ -40,18 +24,26 @@ class H3RequestAdapter:
             raise ValueError("Continuous H3 currently serves the t2va transformer")
         if (sampling.extra_args or {}).get("sampler", "euler") != "euler":
             raise ValueError("Continuous H3 currently supports Euler only")
+        if sampling.lora_request is not None:
+            raise ValueError("Continuous H3 requires the original weights without request LoRA")
         state = StepRequestState(request_id=key, prompt=prompt, sampling=sampling)
-        with self._local_io():
-            return self.pipeline.prepare_encode(state)
+        try:
+            state = await self.io.run(self.pipeline.prepare_encode, state)
+            # Codec allocations now enter the DiT compute stream. Retain their
+            # storage even if a request fails before its queued GPU work ends.
+            record_stream(state.latents)
+            record_stream(state.timesteps)
+            record_stream(state.extra)
+            record_stream(vars(state.extra[native._STEP_BRANCH]))
+            return state
+        except BaseException:
+            self.release(state)
+            raise
 
     def prepare(self, state):
         from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
 
         transformer = state.extra[native._STEP_TRANSFORMER]
-        if transformer.request_cache.config.policy not in ("none", "first_block"):
-            raise ValueError("Continuous H3 supports none or first_block caching")
-        # Stage actors execute blocks outside the normal module offload hooks.
-        transformer.to(self.pipeline.device)
         branch = state.extra[native._STEP_BRANCH]
         schedule = native._minimax_h3_step_schedule(state)
         video_rows, video_times = native.minimax_h3_prepare_edit_rows(
@@ -81,53 +73,27 @@ class H3RequestAdapter:
             audio_target_timesteps=audio_times,
         )
         continuation = transformer.iter_transformer_forward(**inputs)
-        hidden, arguments = next(continuation)
-        arguments = dict(arguments)
-        validate_block_kwargs(arguments)
-        cache = transformer.request_cache
-        enabled = cache.config.policy == "first_block"
-        entry = cache.entry(state.request_id, state.step_index) if enabled else None
-        hit = False
-        if enabled:
-            if transformer.adaln_cache is not None:
-                transformer.adaln_cache.prepare(arguments["t_emb"])
-            first = transformer.blocks[0](hidden, **arguments)
-            hit = cache.should_reuse(
-                entry,
-                first - hidden,
-                state.step_index,
-                len(state.extra[native._STEP_SIGMAS_VIDEO]) - 1,
-            )
-            hidden = first
-        payload = dict(
-            hidden=hidden,
-            arguments=arguments,
-            entry=entry,
-            first_done=enabled,
-            transformer=transformer,
-            continuation=continuation,
-        )
-        # Different steps can pack: pack_block_kwargs preserves per-request
-        # timestep indices, attention documents and positional embeddings.
-        return PreparedStep(
+        return prepare_transformer_step(
+            transformer,
+            continuation,
             state.request_id,
             state.step_index,
-            hit,
-            (id(transformer), hidden.dtype, tuple(hidden.shape[1:]), enabled),
-            payload,
+            len(state.extra[native._STEP_SIGMAS_VIDEO]) - 1,
         )
 
     def commit(self, state, prepared, output):
         from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
 
-        p = prepared.payload
-        transformer = p["transformer"]
-        transformer.to(self.pipeline.device)
-        residual = output - p["hidden"] if p["entry"] is not None and not prepared.hit else None
+        payload = prepared.payload
+        transformer = payload["transformer"]
+        cache_entry = payload["entry"]
+        residual = None
+        if cache_entry is not None and not prepared.hit:
+            residual = output - payload["hidden"]
         if transformer.adaln_cache is not None:
-            transformer.adaln_cache.prepare(p["arguments"]["t_emb"])
+            transformer.adaln_cache.prepare(payload["arguments"]["t_emb"])
         try:
-            p["continuation"].send(output)
+            payload["continuation"].send(output)
         except StopIteration as complete:
             velocities = complete.value
         else:
@@ -135,20 +101,27 @@ class H3RequestAdapter:
         video_velocity, audio_velocity = velocities
         state.extra[native._STEP_AUDIO_NOISE_PRED] = audio_velocity
         self.pipeline.step_scheduler(state, video_velocity)
-        if p["entry"] is not None:
+        if cache_entry is not None:
             transformer.request_cache.commit(
-                p["entry"],
+                cache_entry,
                 prepared.step,
                 prepared.hit,
                 residual,
             )
 
+    def prepare_batch(self, prepared):
+        return prepare_transformer_batch(prepared)
+
     def finished(self, state):
         return state.denoise_completed
 
-    def finish(self, state):
-        with self._local_io():
-            return self.pipeline.post_decode(state)
+    async def finish(self, state):
+        output = await self.io.run(self.pipeline.post_decode, state)
+        record_stream(output)
+        return output
+
+    async def close(self):
+        await self.io.close()
 
     def release(self, state):
         from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
@@ -160,18 +133,105 @@ class H3RequestAdapter:
         state.latents = None
 
 
-def compute_stage(transformer, packet, *, first_done=False):
+def prepare_transformer_step(transformer, continuation, request_id, step, total_steps):
+    """Prepare request-local embeddings and metadata without executing any blocks."""
+    if transformer.start_layer != 0:
+        raise ValueError("Request preparation requires the first pipeline stage")
+    hidden, arguments = next(continuation)
+    arguments = dict(arguments)
+    validate_block_kwargs(arguments)
+    cache = transformer.request_cache
+    policy = cache.config.policy
+    probe_end = {
+        "none": 0,
+        "first_block": 1,
+        "first_stage": transformer.end_layer,
+        "first_stage_periodic": transformer.end_layer,
+    }[policy]
+    if cache.config.probe_blocks and cache.config.probe_blocks[-1] > probe_end:
+        raise ValueError("All probe blocks must belong to the ingress stage")
+    # The cached residual starts at this prefix output, including any skipped
+    # local blocks for FirstBlockCache, or only downstream blocks for FirstStageCache.
+    payload = {
+        "hidden": hidden,
+        "arguments": arguments,
+        "entry": None,
+        "next_layer": 0,
+        "probe_end": probe_end,
+        "total_steps": total_steps,
+        "transformer": transformer,
+        "continuation": continuation,
+    }
+    # Different steps can pack: metadata preserves per-request timestep indices,
+    # attention documents and positional embeddings. Prefix boundaries must match.
+    return PreparedStep(
+        request_id,
+        step,
+        False,
+        (id(transformer), hidden.dtype, tuple(hidden.shape[1:]), probe_end),
+        payload,
+    )
+
+
+def prepare_transformer_batch(prepared):
+    """Execute a packed prefix once, then make independent request cache decisions."""
+    if not prepared:
+        return []
+    first = prepared[0]
+    if any(item.compatibility != first.compatibility for item in prepared):
+        raise ValueError("Ingress batch contains incompatible requests")
+    transformer = first.payload["transformer"]
+    probe_end = first.payload["probe_end"]
+    if not probe_end:
+        return prepared
+    cache = transformer.request_cache
+    packet, lengths = pack_requests([item.payload for item in prepared])
+    block_probes = dict.fromkeys(cache.config.probe_blocks)
+    options = {"probe_residuals": block_probes} if block_probes else {}
+    output = compute_stage(transformer, packet, end_layer=probe_end, **options)["hidden"]
+    probe_chunks = [residual.split(lengths) for residual in block_probes.values()]
+    outputs = output.split(lengths)
+    probes = []
+    for index, (item, hidden) in enumerate(zip(prepared, outputs, strict=True)):
+        if probe_chunks:
+            # Preserve each selected block's residual for independent comparison.
+            probe = torch.stack([chunks[index] for chunks in probe_chunks])
+        else:
+            probe = hidden - item.payload["hidden"]
+        probes.append(probe)
+    entries = [cache.entry(item.request_id, item.step) for item in prepared]
+    decisions = cache.should_reuse_batch(
+        entries,
+        probes,
+        [item.step for item in prepared],
+        [item.payload["total_steps"] for item in prepared],
+    )
+    for item, hidden, entry, hit in zip(prepared, outputs, entries, decisions, strict=True):
+        item.hit = hit
+        item.payload.update(hidden=hidden, entry=entry, next_layer=probe_end)
+    return prepared
+
+
+def compute_stage(transformer, packet, *, start_layer=None, end_layer=None, probe_residuals=None):
     """One actor exclusively owns its GPU and shared AdaLN cache."""
-    transformer.to(packet["hidden"].device)
-    args = {key: value for key, value in packet.items() if key not in ("hidden", "ticket")}
+    start = transformer.start_layer if start_layer is None else start_layer
+    end = transformer.end_layer if end_layer is None else end_layer
+    if not transformer.start_layer <= start <= end <= transformer.end_layer:
+        raise ValueError("Block range is outside the local pipeline stage")
+    if start == end:
+        return packet
+    arguments = {key: value for key, value in packet.items() if key != "hidden"}
     if transformer.adaln_cache is not None:
-        transformer.adaln_cache.prepare(args["t_emb"])
+        transformer.adaln_cache.prepare(arguments["t_emb"])
     hidden = packet["hidden"]
     with torch.profiler.record_function(
         f"monowire/continuous/pp{transformer.pp_group.rank_in_group}/blocks"
     ):
-        for index in range(transformer.start_layer + int(first_done), transformer.end_layer):
-            hidden = transformer.blocks[index](hidden, **args)
+        for index in range(start, end):
+            block_input = hidden
+            hidden = transformer.blocks[index](hidden, **arguments)
+            if probe_residuals is not None and index + 1 in probe_residuals:
+                probe_residuals[index + 1] = hidden - block_input
     packet["hidden"] = hidden
     return packet
 
@@ -184,22 +244,40 @@ class H3StageAdapter:
         self.group = transformer.pp_group
 
     def validate(self, prepared):
-        if any(p.payload["transformer"] is not self.transformer for p in prepared):
+        if any(item.payload["transformer"] is not self.transformer for item in prepared):
             raise ValueError("A physical batch cannot mix H3 transformers")
+        if prepared and any(
+            item.payload["next_layer"] != prepared[0].payload["next_layer"] for item in prepared
+        ):
+            raise ValueError("A physical batch cannot mix cache prefix boundaries")
 
     def reuse(self, prepared):
-        return [p.payload["hidden"] + p.payload["entry"].residual for p in prepared]
+        return [item.payload["hidden"] + item.payload["entry"].residual for item in prepared]
 
     def pack(self, prepared):
-        lengths = [p.payload["hidden"].shape[0] for p in prepared]
-        packet = pack_block_kwargs([p.payload["arguments"] for p in prepared])
-        packet = dict(packet)
-        packet["hidden"] = torch.cat([p.payload["hidden"] for p in prepared])
-        compute_stage(self.transformer, packet, first_done=prepared[0].payload["first_done"])
+        packet, lengths = pack_requests([item.payload for item in prepared])
+        compute_stage(self.transformer, packet, start_layer=prepared[0].payload["next_layer"])
         return packet, lengths
 
     def compute(self, packet):
         return compute_stage(self.transformer, packet)
 
-    def unpack(self, output, context):
-        return list(output.split(context))
+    def export_requests(self, prepared):
+        """Run the local miss suffix once, then expose independently routable rows."""
+        if prepared[0].payload["next_layer"] == self.transformer.end_layer:
+            outputs = [item.payload["hidden"] for item in prepared]
+        else:
+            packet, lengths = self.pack(prepared)
+            outputs = packet["hidden"].split(lengths)
+        return [
+            {
+                "hidden": hidden,
+                "arguments": item.payload["arguments"],
+                "compatibility": (hidden.dtype, tuple(hidden.shape[1:])),
+            }
+            for item, hidden in zip(prepared, outputs, strict=True)
+        ]
+
+    def combine_requests(self, items):
+        packet, _ = pack_requests(items)
+        return packet

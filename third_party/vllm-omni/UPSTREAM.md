@@ -14,7 +14,13 @@ The source version identifies this modified v0.32.0 source snapshot. Future chan
 
 - `vllm_omni/diffusion/models/minimax_h3/minimax_h3_transformer.py`:
   exposes block construction, block execution, and a resumable boundary between
-  input preparation and output heads for pipeline-parallel inference.
+  input preparation and output heads for pipeline-parallel inference. Block-only
+  workers can omit input/output modules at construction; Diffusers RoPE
+  reconstruction follows the modules actually owned by the worker.
+- `vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py`:
+  scopes encoder/media collectives through an instance method. Native H3 keeps
+  its distributed behavior; MonoWire ingress instances use local codec I/O
+  without replacing process-global functions.
 - `setup.py`, `pyproject.toml`, `.gitignore`, `vllm_omni/_version.py`, and
   `vllm_omni/version.py`: use a fixed source version instead of deriving it from
   a nested Git repository. Runtime dependency selection remains upstream's.

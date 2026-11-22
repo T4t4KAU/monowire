@@ -522,97 +522,6 @@ def _minimax_h3_output_seeds(seed: int, num_outputs: int) -> list[int]:
     return [int(seed) + output_index for output_index in range(int(num_outputs))]
 
 
-def _dit_rank_world() -> tuple[Any, int, int]:
-    if not dist.is_initialized():
-        return None, 0, 1
-    group = get_world_group().device_group
-    return group, dist.get_rank(group), dist.get_world_size(group)
-
-
-def _broadcast_rank0_exception(exc: Exception | None) -> None:
-    """Synchronize a rank-0-only exception across every DiT rank.
-
-    H3 reference-video preparation runs only on rank 0; the other DiT ranks
-    return ``None`` without touching disk. When rank 0 raises inside that
-    path it exits :meth:`prepare_encode` before reaching the downstream
-    ``dist.broadcast`` calls, and non-zero ranks then hang on those
-    collectives forever. Every rank calls this helper right after the
-    rank-0-only work, before any subsequent collective, so all ranks either
-    raise the same error together or all continue.
-    """
-    group, rank, world_size = _dit_rank_world()
-    if world_size == 1:
-        if exc is not None:
-            raise exc
-        return
-    if rank == 0:
-        if exc is None:
-            payload: list[Any] = [None]
-        else:
-            payload = [
-                {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "status_code": getattr(exc, "status_code", None),
-                    "error_type": getattr(exc, "error_type", None),
-                }
-            ]
-    else:
-        payload = [None]
-    dist.broadcast_object_list(payload, src=0, group=group)
-    info = payload[0]
-    if info is None:
-        return
-    if rank == 0:
-        assert exc is not None
-        raise exc
-    # Rebuild a matching client-facing error on non-zero ranks so the runner's
-    # per-request try/except records the same 4xx status as rank 0. The exact
-    # subclass need not survive the wire; the message and status suffice.
-    status_code = info.get("status_code")
-    error_type = info.get("error_type")
-    message = f"[rank 0] {info['type']}: {info['message']}"
-    if status_code is not None:
-        raise client_error_from_metadata(
-            message,
-            status_code=int(status_code),
-            error_type=error_type,
-        )
-    raise RuntimeError(message)
-
-
-def _broadcast_tensor(
-    tensor: torch.Tensor | None,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    group, rank, world_size = _dit_rank_world()
-    if world_size == 1:
-        if tensor is None:
-            raise ValueError("source tensor is required for single-rank execution")
-        return tensor.to(device=device, dtype=dtype)
-
-    shape = torch.zeros(5, dtype=torch.long, device=device)
-    if rank == 0:
-        if tensor is None:
-            raise ValueError("rank 0 must provide a tensor to broadcast")
-        shape[0] = tensor.ndim
-        shape[1 : tensor.ndim + 1] = torch.tensor(
-            tensor.shape,
-            device=device,
-        )
-    dist.broadcast(shape, src=0, group=group)
-    ndim = int(shape[0].item())
-    tensor_shape = tuple(int(v) for v in shape[1 : ndim + 1].tolist())
-    if rank == 0:
-        output = tensor.to(device=device, dtype=dtype).contiguous()
-    else:
-        output = torch.empty(tensor_shape, device=device, dtype=dtype)
-    dist.broadcast(output, src=0, group=group)
-    return output
-
-
 class _SingleRankEncoderGroup:
     """Lightweight encoder group for ``text_encoder_tp_size == 1``.
 
@@ -1074,7 +983,7 @@ class MiniMaxH3Pipeline(
             self.tokenizer = None
             self.processor = None
 
-        _, rank, dit_world = _dit_rank_world()
+        _, rank, dit_world = self._io_rank_world()
         self._dit_rank = rank
         if self.load_text_encoder:
             text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1))
@@ -1399,6 +1308,95 @@ class MiniMaxH3Pipeline(
             self._fasth3.check_task(task)
         return task
 
+    def _io_rank_world(self) -> tuple[Any, int, int]:
+        if not dist.is_initialized():
+            return None, 0, 1
+        group = get_world_group().device_group
+        return group, dist.get_rank(group), dist.get_world_size(group)
+
+    def _broadcast_rank0_exception(self, exc: Exception | None) -> None:
+        """Synchronize a rank-0-only exception across every DiT rank.
+
+        H3 reference-video preparation runs only on rank 0; the other DiT ranks
+        return ``None`` without touching disk. When rank 0 raises inside that
+        path it exits :meth:`prepare_encode` before reaching the downstream
+        ``dist.broadcast`` calls, and non-zero ranks then hang on those
+        collectives forever. Every rank calls this helper right after the
+        rank-0-only work, before any subsequent collective, so all ranks either
+        raise the same error together or all continue.
+        """
+        group, rank, world_size = self._io_rank_world()
+        if world_size == 1:
+            if exc is not None:
+                raise exc
+            return
+        if rank == 0:
+            if exc is None:
+                payload: list[Any] = [None]
+            else:
+                payload = [
+                    {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "status_code": getattr(exc, "status_code", None),
+                        "error_type": getattr(exc, "error_type", None),
+                    }
+                ]
+        else:
+            payload = [None]
+        dist.broadcast_object_list(payload, src=0, group=group)
+        info = payload[0]
+        if info is None:
+            return
+        if rank == 0:
+            assert exc is not None
+            raise exc
+        # Rebuild a matching client-facing error on non-zero ranks so the runner's
+        # per-request try/except records the same 4xx status as rank 0. The exact
+        # subclass need not survive the wire; the message and status suffice.
+        status_code = info.get("status_code")
+        error_type = info.get("error_type")
+        message = f"[rank 0] {info['type']}: {info['message']}"
+        if status_code is not None:
+            raise client_error_from_metadata(
+                message,
+                status_code=int(status_code),
+                error_type=error_type,
+            )
+        raise RuntimeError(message)
+
+    def _broadcast_tensor(
+        self,
+        tensor: torch.Tensor | None,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        group, rank, world_size = self._io_rank_world()
+        if world_size == 1:
+            if tensor is None:
+                raise ValueError("source tensor is required for single-rank execution")
+            return tensor.to(device=device, dtype=dtype)
+
+        shape = torch.zeros(5, dtype=torch.long, device=device)
+        if rank == 0:
+            if tensor is None:
+                raise ValueError("rank 0 must provide a tensor to broadcast")
+            shape[0] = tensor.ndim
+            shape[1 : tensor.ndim + 1] = torch.tensor(
+                tensor.shape,
+                device=device,
+            )
+        dist.broadcast(shape, src=0, group=group)
+        ndim = int(shape[0].item())
+        tensor_shape = tuple(int(v) for v in shape[1 : ndim + 1].tolist())
+        if rank == 0:
+            output = tensor.to(device=device, dtype=dtype).contiguous()
+        else:
+            output = torch.empty(tensor_shape, device=device, dtype=dtype)
+        dist.broadcast(output, src=0, group=group)
+        return output
+
     def _build_text_encoder_group(self, text_encoder_tp_size: int) -> Any:
         """Create the encoder tensor-parallel process group.
 
@@ -1646,7 +1644,7 @@ class MiniMaxH3Pipeline(
     ) -> tuple[torch.Tensor | None, list[tuple[int, int, int]]]:
         rows: list[torch.Tensor] = []
         shapes: list[tuple[int, int, int]] = []
-        _, rank, _ = _dit_rank_world()
+        _, rank, _ = self._io_rank_world()
         # encode_image retains parallel tiling when there are enough tiles.
         # Every VAE rank must finish its codec collectives before the latent
         # broadcast, including when refinement enlarges the keyframe images.
@@ -1665,7 +1663,7 @@ class MiniMaxH3Pipeline(
                 if encode_images:
                     image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
                 rows.append(
-                    _broadcast_tensor(
+                    self._broadcast_tensor(
                         image_rows if rank == 0 else None,
                         dtype=torch.float32,
                         device=self.device,
@@ -2533,7 +2531,7 @@ class MiniMaxH3Pipeline(
         return videos
 
     def encode_prompt(self, prepared: PreparedEncoderInputs | None) -> tuple[torch.Tensor, torch.Tensor]:
-        _, rank, _ = _dit_rank_world()
+        _, rank, _ = self._io_rank_world()
         ids = tags = hidden = None
         vision_kwargs: dict[str, torch.Tensor] = {}
         error = None
@@ -2569,17 +2567,17 @@ class MiniMaxH3Pipeline(
                 )
             except Exception as exc:
                 error = exc
-        _broadcast_rank0_exception(error)
+        self._broadcast_rank0_exception(error)
         if rank < self.text_encoder_tp_size:
             ids = self._distribute_encode_inputs(ids, vision_kwargs)
             hidden = self._encode_text_hidden(ids, vision_kwargs)
         return (
-            _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
-            _broadcast_tensor(tags, dtype=torch.long, device=self.device),
+            self._broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
+            self._broadcast_tensor(tags, dtype=torch.long, device=self.device),
         )
 
     def _distribute_media_inputs(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaInput:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = self._io_rank_world()
         if world_size == 1:
             assert media is not None
             return media
@@ -2589,7 +2587,7 @@ class MiniMaxH3Pipeline(
         metadata, dtypes = header[0]
         received = []
         for index, dtype in enumerate(dtypes):
-            value = _broadcast_tensor(tensors[index] if rank == 0 else None, dtype=dtype, device=self.device)
+            value = self._broadcast_tensor(tensors[index] if rank == 0 else None, dtype=dtype, device=self.device)
             if rank != 0:
                 received.append(value.cpu())
             del value
@@ -2601,7 +2599,7 @@ class MiniMaxH3Pipeline(
     def _broadcast_media_conditioning(
         self, conditioning: MiniMaxH3EncoderMediaConditioning | None
     ) -> MiniMaxH3EncoderMediaConditioning:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = self._io_rank_world()
         if world_size == 1:
             assert conditioning is not None
             return conditioning
@@ -2633,11 +2631,13 @@ class MiniMaxH3Pipeline(
         tensors = {}
         for name, dtype in dtypes.items():
             source = getattr(conditioning, name) if rank == 0 else None
-            tensors[name] = _broadcast_tensor(source, dtype=dtype, device=self.device) if dtype is not None else None
+            tensors[name] = (
+                self._broadcast_tensor(source, dtype=dtype, device=self.device) if dtype is not None else None
+            )
         return MiniMaxH3EncoderMediaConditioning(**metadata, **tensors)
 
     def _encode_local_media(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaConditioning:
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = self._io_rank_world()
         distributed_video = self.video_vae.is_distributed_enabled()
         if distributed_video:
             media = self._distribute_media_inputs(media)
@@ -2695,7 +2695,7 @@ class MiniMaxH3Pipeline(
         Returns initial conditioning and optional request-owned window embeddings.
         Invalid continuation prompts are broadcast before any encoder collective.
         """
-        group, rank, world_size = _dit_rank_world()
+        group, rank, world_size = self._io_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
         prepared = text_conditioning = None
         initial_noise_params = None
@@ -2785,7 +2785,7 @@ class MiniMaxH3Pipeline(
                         }
             except Exception as exc:
                 error = exc
-        _broadcast_rank0_exception(error)
+        self._broadcast_rank0_exception(error)
         header = [(text_conditioning is not None, initial_noise_params, visual_noise_params)]
         if world_size > 1:
             dist.broadcast_object_list(header, src=0, group=group)
@@ -2808,12 +2808,12 @@ class MiniMaxH3Pipeline(
                 else None
             )
             if reuse_text:
-                hidden = _broadcast_tensor(
+                hidden = self._broadcast_tensor(
                     text_conditioning.hidden_states if rank == 0 else None,
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
-                tags = _broadcast_tensor(
+                tags = self._broadcast_tensor(
                     text_conditioning.token_tags if rank == 0 else None, dtype=torch.long, device=self.device
                 )
             else:
