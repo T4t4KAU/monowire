@@ -6,6 +6,7 @@ bounded by active residency; model-specific stream ownership stays in the adapte
 """
 
 import asyncio
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
@@ -26,12 +27,19 @@ class RequestAdapter(Protocol):
 
 
 class BatchExecutor(Protocol):
-    def start(self) -> asyncio.Future[PipelineFailure]:
+    def start(
+        self, *, on_capacity: Callable[[], None] | None = None
+    ) -> asyncio.Future[PipelineFailure]:
         """Listen for service failures, even before the first submission.
 
         The future resolves to the fatal error; it does not raise or depend on
         request tickets. The executor owns it through close().
         """
+        ...
+
+    @property
+    def can_submit(self) -> bool:
+        """Whether one miss batch can be published without exceeding send capacity."""
         ...
 
     def submit(self, prepared: list) -> list[asyncio.Future]: ...

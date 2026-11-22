@@ -14,6 +14,8 @@ import torch
 from torch import nn
 from torch.nn.modules import module as module_hooks
 
+ContentKey = str | tuple[str, ...]
+
 
 class ExactProjectionCache:
     """Bounded, exact memoization for deterministic conditioning projections.
@@ -41,10 +43,10 @@ class ExactProjectionCache:
         if type(max_bytes) is not int or max_bytes < 0:
             raise ValueError("Projection cache budget must be a nonnegative byte count")
         self.max_bytes = max_bytes
-        self._entries: dict[tuple[str, str, tuple[Any, ...]], tuple[Any, torch.Tensor, int]] = {}
+        self._entries: dict[tuple[ContentKey, str, tuple[Any, ...]], tuple[Any, torch.Tensor, int]] = {}
         self._bytes = 0
         self._input: weakref.ReferenceType[torch.Tensor] | None = None
-        self._key: str | None = None
+        self._key: ContentKey | None = None
         self.hits = self.misses = 0
 
     def clear(self) -> None:
@@ -56,9 +58,31 @@ class ExactProjectionCache:
     def prepare(self, embedding: torch.Tensor) -> None:
         self._input = None
         self._key = None
-        if not self.max_bytes or torch.is_grad_enabled() or torch.compiler.is_compiling():
+        key = None
+        if self.max_bytes and not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+            key = tensor_digest(embedding)
+        self.prepare_from_key(embedding, key)
+
+    def prepared_key(self, embedding: torch.Tensor) -> ContentKey | None:
+        """Export the content key only for the currently bound immutable input."""
+        if self._input is not None and self._input() is embedding:
+            return self._key
+        return None
+
+    def prepare_from_key(self, embedding: torch.Tensor, key: ContentKey | None) -> None:
+        """Bind an unchanged input or its exact transported copy without a GPU read.
+
+        Keys must originate from ``prepare`` on the actual tensor contents. An
+        ordered tuple of those keys identifies concatenated request embeddings;
+        request IDs, timestep labels and tensor addresses are not content keys.
+        Passing None disables reuse for this input. Weight and numerical-setting
+        checks in ``project`` still apply.
+        """
+        self._input = None
+        self._key = None
+        if key is None or not self.max_bytes or torch.is_grad_enabled() or torch.compiler.is_compiling():
             return
-        self._key = tensor_digest(embedding)
+        self._key = key
         self._input = weakref.ref(embedding)
 
     @staticmethod

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,7 @@ from safetensors import safe_open
 from torch import nn
 
 from vllm_omni.diffusion.cache.exact_projection_cache import (
+    ContentKey,
     ExactProjectionCache,
     tensor_digest,
 )
@@ -51,15 +53,67 @@ class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
     def __init__(self, *, max_bytes: int = 256 * 1024**2, offload_weights: bool = False) -> None:
         super().__init__(max_bytes=max_bytes)
         self.offload_weights = offload_weights
+        self._time_embeddings = OrderedDict()
+        self._time_embedding_bytes = 0
         self.sidecar: MiniMaxH3AdalnCache | None = None
         self._sidecar_signatures: dict[str, Any] = {}
         self._sidecar_plan: int | None = None
 
     def clear(self) -> None:
         super().clear()
+        self._time_embeddings.clear()
+        self._time_embedding_bytes = 0
         self.sidecar = None
         self._sidecar_signatures.clear()
         self._sidecar_plan = None
+
+    @torch.compiler.disable
+    def embed_timesteps(self, module: nn.Module, timesteps: torch.Tensor, device) -> torch.Tensor:
+        """Reuse exact time embeddings from CPU plans, including their content keys.
+
+        Both the module state and math settings participate in identity. CUDA
+        plans (editing), hooks, training and unversioned weights bypass reuse.
+        A new plan still computes and hashes the real embedding once.
+        """
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        device = torch.device(device)
+        signature = None
+        if (
+            self.max_bytes
+            and timesteps.device.type == "cpu"
+            and not torch.is_grad_enabled()
+            and not module.training
+            and get_tensor_model_parallel_world_size() == 1
+            and not self._has_forward_hooks(module)
+        ):
+            try:
+                signature = self._signature(module)
+            except RuntimeError:
+                pass
+        key = None
+        if signature is not None:
+            key = (tensor_digest(timesteps), signature, device, self._numerical_settings(device.type))
+            cached = self._time_embeddings.get(key)
+            if cached is not None:
+                self._time_embeddings.move_to_end(key)
+                embedding, content_key, _ = cached
+                self.prepare_from_key(embedding, content_key)
+                return embedding
+        embedding = module(timesteps.to(device))
+        self.prepare(embedding)
+        if key is not None:
+            size = embedding.numel() * embedding.element_size()
+            budget = min(self.max_bytes, 8 * 1024**2)
+            if size <= budget:
+                while self._time_embeddings and (
+                    self._time_embedding_bytes + size > budget or len(self._time_embeddings) >= 128
+                ):
+                    _, (_, _, removed) = self._time_embeddings.popitem(last=False)
+                    self._time_embedding_bytes -= removed
+                self._time_embeddings[key] = (embedding, self.prepared_key(embedding), size)
+                self._time_embedding_bytes += size
+        return embedding
 
     def seed(self, sidecar: MiniMaxH3AdalnCache, modules: Mapping[str, nn.Module]) -> None:
         # A rejected seed must not retain the sidecar's device payload.
@@ -74,6 +128,11 @@ class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
         # this boundary also preserves reuse under full-model compilation.
         self._sidecar_plan = None
         super().prepare(embedding)
+
+    @torch.compiler.disable
+    def prepare_from_key(self, embedding: torch.Tensor, key: ContentKey | None) -> None:
+        self._sidecar_plan = None
+        super().prepare_from_key(embedding, key)
         if self._key is None or self.sidecar is None:
             return
         if math_identity(embedding.device) != self.sidecar.manifest["math"]:

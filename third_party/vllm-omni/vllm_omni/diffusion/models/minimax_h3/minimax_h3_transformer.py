@@ -1697,6 +1697,12 @@ class MiniMaxH3DiTModel(nn.Module):
         contract) do not silently miss the kwarg. ``forward()`` reads the real
         value from ``packed_seq_params["num_requests"]``.
         """
+        cache = getattr(self, "adaln_cache", None)
+        t_emb = (
+            cache.embed_timesteps(self.time_embedder, unique_timesteps, device)
+            if cache is not None
+            else self.time_embedder(unique_timesteps.to(device))
+        )
         local_len = local_span[1]
         img_global_pos, audio_global_pos, img_local_pos, audio_local_pos, text_local_pos, text_local_indices = (
             self._embed_row_indices(
@@ -1744,7 +1750,6 @@ class MiniMaxH3DiTModel(nn.Module):
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
         )
 
-        t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
     def run_transformer_blocks(self, hidden, **block_kwargs):
@@ -1851,7 +1856,7 @@ class MiniMaxH3DiTModel(nn.Module):
             x=x,
             audio_x=audio_x,
             text_embeddings_selected=text_selected,
-            unique_timesteps=unique_timesteps.view(-1).to(device),
+            unique_timesteps=unique_timesteps.view(-1),
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
@@ -1862,9 +1867,6 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
             local_span=local_span,
         )
-
-        if getattr(self, "adaln_cache", None) is not None:
-            self.adaln_cache.prepare(t_emb)
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)

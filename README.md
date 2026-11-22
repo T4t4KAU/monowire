@@ -43,11 +43,12 @@ Repeat `--prompt` to add requests. The native VAE requires `--trust-remote-code`
 | `--batch-size` | Maximum active requests per ingress replica. |
 | `--microbatch-size` | Maximum requests per ingress forward. |
 | `--downstream-batch-size` | Maximum requests per suffix forward. |
+| `--async-transport` / `--no-async-transport` | Grouped transfers and deferred CUDA completion waits; enabled by default. Use `--no-async-transport` to disable. |
 | `--cache` | `none` (default), `first_block`, `first_stage`, or `first_stage_periodic`. |
 | `--cache-threshold` | Reuse threshold; defaults to `0.17`. |
 | `--cache-max-skip` | Maximum consecutive reuse steps; defaults to `2`. |
 
-`first_block` and `first_stage` compare prefix residuals with the last full evaluation. `first_stage_periodic` compares adjacent steps. Cache hits finish the step at ingress; misses enter the shared suffix. Batch sizes are upper limits, so batches may be partial. Use `--cache none` to disable reuse and calibrate thresholds against output quality.
+`first_block` and `first_stage` compare prefix residuals with the last full evaluation. `first_stage_periodic` compares adjacent steps. Cache hits finish the step at ingress; misses enter the shared suffix. Batch sizes are upper limits, so batches may be partial. Prefix lookahead is bounded separately from the send queue (`ContinuousConfig.prefix_buffer_batches`, default 2). Use `--cache none` to disable reuse and calibrate thresholds against output quality.
 
 For two ingress replicas and six suffix GPUs, add:
 

@@ -21,6 +21,15 @@ The source version identifies this modified v0.32.0 source snapshot. Future chan
   scopes encoder/media collectives through an instance method. Native H3 keeps
   its distributed behavior; MonoWire ingress instances use local codec I/O
   without replacing process-global functions.
+- `vllm_omni/diffusion/cache/exact_projection_cache.py` and
+  `vllm_omni/diffusion/models/minimax_h3/adaln_cache.py`: allow immutable
+  embeddings to carry their existing content keys through pipeline transport
+  and ordered batching, avoiding repeated GPU-to-CPU hashing. Projection weight,
+  numerical-setting, and sidecar validation remain in place.
+- `minimax_h3/denoise_loop.py` and `minimax_h3/adaln_cache.py`: construct
+  unedited timestep plans from CPU scalars and reuse exact time embeddings under
+  input, weight, evaluation-mode and numerical-setting guards. New plans still
+  hash the computed embedding; edited plans keep the general tensor path.
 - `setup.py`, `pyproject.toml`, `.gitignore`, `vllm_omni/_version.py`, and
   `vllm_omni/version.py`: use a fixed source version instead of deriving it from
   a nested Git repository. Runtime dependency selection remains upstream's.

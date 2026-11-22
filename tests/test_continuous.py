@@ -28,7 +28,10 @@ def batch_futures(operation, count):
 
 
 class ServiceExecutor:
-    def start(self):
+    can_submit = True
+
+    def start(self, *, on_capacity=None):
+        self.on_capacity = on_capacity
         if not hasattr(self, "failure_signal"):
             self.failure_signal = asyncio.get_running_loop().create_future()
         return self.failure_signal
@@ -68,6 +71,45 @@ class Adapter:
 
 
 class ContinuousTests(unittest.IsolatedAsyncioTestCase):
+    async def test_blocked_sender_allows_bounded_prefix_lookahead(self):
+        batches = []
+        first, second = asyncio.Event(), asyncio.Event()
+
+        class ObservedAdapter(Adapter):
+            def prepare_batch(self, prepared):
+                batches.append(prepared)
+                (first if len(batches) == 1 else second).set()
+                return prepared
+
+        class GatedExecutor(ServiceExecutor):
+            def __init__(self):
+                self.futures = []
+
+            def submit(self, prepared):
+                self.can_submit = False
+                future = asyncio.get_running_loop().create_future()
+                self.futures.append(future)
+                return [future]
+
+        executor = GatedExecutor()
+        scheduler = ContinuousScheduler(ObservedAdapter(), executor, ContinuousConfig(2, 1))
+        scheduler.start()
+        outputs = [scheduler.submit(str(i), 1) for i in range(2)]
+        await asyncio.wait_for(first.wait(), 1)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.assertEqual(len(batches), 2)
+        executor.can_submit = True
+        executor.on_capacity()
+        await asyncio.wait_for(second.wait(), 1)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.assertFalse(any(future.done() for future in executor.futures))
+        for future in executor.futures:
+            future.set_result(1)
+        self.assertEqual(await asyncio.wait_for(asyncio.gather(*outputs), 1), [1, 1])
+        await scheduler.close()
+
     async def test_compatible_groups_rotate_while_first_group_stays_busy(self):
         dispatched = []
 
@@ -93,7 +135,9 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(scheduler.close(), 2)
         self.assertEqual([f.result() for f in results], [10, 10, 10, 1])
         self.assertEqual(len(dispatched), 31)
-        self.assertEqual(dispatched.index("b"), 1)
+        # Admissions are also bounded per turn; once admitted, the other
+        # compatibility group must run without waiting for all a steps.
+        self.assertLessEqual(dispatched.index("b"), 4)
 
     async def test_cancelled_pending_future_is_removed_while_active_slot_is_full(self):
         entered, gate = asyncio.Event(), asyncio.Event()
@@ -435,3 +479,71 @@ class IndependentCompletionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(scheduler.close(), 2)
         self.assertIsInstance(result.exception(), RuntimeError)
         self.assertEqual(adapter.released, ["admitting"])
+
+    async def test_blocked_misses_have_bounded_lookahead_and_resume(self):
+        prefixes = []
+
+        class MissAdapter(Adapter):
+            def prepare(self, state):
+                prepared = super().prepare(state)
+                prepared.hit = False
+                return prepared
+
+            def prepare_batch(self, prepared):
+                prefixes.append([p.request_id for p in prepared])
+                return prepared
+
+        class Executor(ServiceExecutor):
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, prepared):
+                self.can_submit = False
+                futures = [asyncio.get_running_loop().create_future() for _ in prepared]
+                self.calls.append(futures)
+                return futures
+
+        executor = Executor()
+        scheduler = ContinuousScheduler(MissAdapter(), executor, ContinuousConfig(10, 2))
+        outputs = [scheduler.submit(str(i), 1) for i in range(10)]
+        for _ in range(30):
+            await asyncio.sleep(0)
+        self.assertEqual(len(prefixes), 3)  # One sent, two retained locally.
+        self.assertEqual(sum(map(len, scheduler.ready.values())), 4)
+        self.assertEqual(len(executor.calls), 1)
+        while not all(f.done() for f in outputs):
+            for futures in executor.calls:
+                for future in futures:
+                    if not future.done():
+                        future.set_result(1)
+            executor.can_submit = True
+            executor.on_capacity()
+            for _ in range(10):
+                await asyncio.sleep(0)
+        self.assertEqual(await asyncio.gather(*outputs), [1] * 10)
+        await scheduler.close()
+
+    async def test_completion_work_yields_after_one_batch(self):
+        from types import SimpleNamespace
+
+        adapter = Adapter()
+        scheduler = ContinuousScheduler(adapter, ServiceExecutor(), ContinuousConfig(8, 2))
+        states = []
+        for i in range(6):
+            state = dict(key=str(i), step=0, total=3, value=0)
+            request = SimpleNamespace(
+                key=str(i),
+                state=state,
+                inflight=True,
+                future=asyncio.get_running_loop().create_future(),
+            )
+            completion = asyncio.get_running_loop().create_future()
+            completion.set_result(1)
+            scheduler.tasks[completion] = (request, adapter.prepare(state))
+            states.append(state)
+        scheduler._complete()
+        self.assertEqual([s["step"] for s in states], [1, 1, 0, 0, 0, 0])
+        self.assertEqual(sum(map(len, scheduler.ingress.values())), 2)
+        scheduler._complete()
+        scheduler._complete()
+        self.assertFalse(scheduler.tasks)

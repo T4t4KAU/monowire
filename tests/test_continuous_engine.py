@@ -129,13 +129,13 @@ class EngineTests(IsolatedAsyncioTestCase):
                 async def peer():
                     await source_idle.wait()
                     if first_request:
-                        packet = await asyncio.to_thread(outgoing.recv)
+                        packet = (await asyncio.to_thread(outgoing.recv)).value
                         item = packet["items"][0]
                         returning.send({"items": [item]})
                         await first_done.wait()
                     self.assertFalse(executor.waiting)
                     returning.send({"failure": "idle link failed"})
-                    self.assertTrue((await asyncio.to_thread(outgoing.recv))["stop"])
+                    self.assertTrue((await asyncio.to_thread(outgoing.recv)).value["stop"])
                     returning.send({"stop": True})
 
                 async def collect():

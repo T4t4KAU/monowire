@@ -4,6 +4,7 @@ import torch
 
 from ...channels import record_stream
 from ...continuous import PreparedStep
+from ...tensor_payload import SharedTensor, TensorParts
 from .io import CodecWorker
 from .packing import pack_requests, validate_block_kwargs
 
@@ -73,13 +74,20 @@ class H3RequestAdapter:
             audio_target_timesteps=audio_times,
         )
         continuation = transformer.iter_transformer_forward(**inputs)
-        return prepare_transformer_step(
+        prepared = prepare_transformer_step(
             transformer,
             continuation,
             state.request_id,
             state.step_index,
             len(state.extra[native._STEP_SIGMAS_VIDEO]) - 1,
         )
+        rope = prepared.payload["arguments"]["rope_table"]
+        previous = state.extra.get("monowire_rope")
+        if previous is None or previous[0] is not rope:
+            previous = (rope, SharedTensor.snapshot(rope))
+            state.extra["monowire_rope"] = previous
+        prepared.payload["shared_rope"] = previous[1]
+        return prepared
 
     def commit(self, state, prepared, output):
         from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
@@ -91,7 +99,9 @@ class H3RequestAdapter:
         if cache_entry is not None and not prepared.hit:
             residual = output - payload["hidden"]
         if transformer.adaln_cache is not None:
-            transformer.adaln_cache.prepare(payload["arguments"]["t_emb"])
+            transformer.adaln_cache.prepare_from_key(
+                payload["arguments"]["t_emb"], payload["adaln_key"]
+            )
         try:
             payload["continuation"].send(output)
         except StopIteration as complete:
@@ -161,6 +171,11 @@ def prepare_transformer_step(transformer, continuation, request_id, step, total_
         "total_steps": total_steps,
         "transformer": transformer,
         "continuation": continuation,
+        "adaln_key": (
+            transformer.adaln_cache.prepared_key(arguments["t_emb"])
+            if transformer.adaln_cache is not None
+            else None
+        ),
     }
     # Different steps can pack: metadata preserves per-request timestep indices,
     # attention documents and positional embeddings. Prefix boundaries must match.
@@ -220,9 +235,14 @@ def compute_stage(transformer, packet, *, start_layer=None, end_layer=None, prob
         raise ValueError("Block range is outside the local pipeline stage")
     if start == end:
         return packet
-    arguments = {key: value for key, value in packet.items() if key != "hidden"}
+    arguments = {key: value for key, value in packet.items() if key not in {"hidden", "adaln_key"}}
+    rope = arguments.get("rope_table")
+    if isinstance(rope, TensorParts):
+        arguments["rope_table"] = rope.materialize()
+    elif isinstance(rope, SharedTensor):
+        arguments["rope_table"] = rope.value
     if transformer.adaln_cache is not None:
-        transformer.adaln_cache.prepare(arguments["t_emb"])
+        transformer.adaln_cache.prepare_from_key(arguments["t_emb"], packet["adaln_key"])
     hidden = packet["hidden"]
     with torch.profiler.record_function(
         f"monowire/continuous/pp{transformer.pp_group.rank_in_group}/blocks"
@@ -272,7 +292,13 @@ class H3StageAdapter:
         return [
             {
                 "hidden": hidden,
-                "arguments": item.payload["arguments"],
+                "arguments": {
+                    **item.payload["arguments"],
+                    "rope_table": item.payload.get(
+                        "shared_rope", item.payload["arguments"]["rope_table"]
+                    ),
+                },
+                "adaln_key": item.payload["adaln_key"],
                 "compatibility": (hidden.dtype, tuple(hidden.shape[1:])),
             }
             for item, hidden in zip(prepared, outputs, strict=True)

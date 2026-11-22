@@ -94,6 +94,14 @@ class MiniMaxH3DenoiseBranch:
         # it can rebuild ``cu_seqlens`` without a device sync per step.
         self.used_len = int(cu[1])
         self.text_len = text_len
+        # Fixed semantic groups; scalar values vary per step, membership does not.
+        groups = torch.zeros(seq_len, dtype=torch.long, device="cpu")
+        groups[self.img_pos.cpu()[self.update_mask.cpu()]] = 1
+        groups[self.img_pos.cpu()[~self.update_mask.cpu()]] = 2
+        groups[self.audio_pos.cpu()[self.audio_update_mask.cpu()]] = 3
+        groups[self.audio_pos.cpu()[~self.audio_update_mask.cpu()]] = 4
+        self._present_time_groups, group_indices = torch.unique(groups, return_inverse=True)
+        self._time_group_indices = group_indices.to(device)
         self.img_pos_dev = self.img_pos.to(device)
         self.audio_pos_dev = self.audio_pos.to(device)
         self.update_mask_dev = self.update_mask.to(device)
@@ -195,17 +203,26 @@ class MiniMaxH3DenoiseBranch:
         x[0].index_copy_(0, self.img_pos_dev, video_rows)
         audio_x = self.audio_x_base.clone()
         audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
-        timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
-        self.fill_timesteps(
-            timesteps,
-            t_video=t_video,
-            t_audio=t_audio,
-            imgvid_cond_timestep=imgvid_cond_timestep,
-            audio_ref_cond_timestep=audio_ref_cond_timestep,
-            video_target_timesteps=video_target_timesteps,
-            audio_target_timesteps=audio_target_timesteps,
-        )
-        unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
+        if video_target_timesteps is None and audio_target_timesteps is None:
+            values = torch.tensor(
+                [t_video, t_video, imgvid_cond_timestep,
+                 t_audio if self.locked_audio_rows is None else 1.0, audio_ref_cond_timestep],
+                dtype=torch.float32, device="cpu",
+            )[self._present_time_groups]
+            unique_timesteps, group_inverse = torch.unique(values, sorted=True, return_inverse=True)
+            inverse_indices = group_inverse.to(self.device)[self._time_group_indices]
+        else:
+            timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
+            self.fill_timesteps(
+                timesteps,
+                t_video=t_video,
+                t_audio=t_audio,
+                imgvid_cond_timestep=imgvid_cond_timestep,
+                audio_ref_cond_timestep=audio_ref_cond_timestep,
+                video_target_timesteps=video_target_timesteps,
+                audio_target_timesteps=audio_target_timesteps,
+            )
+            unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         return {
             **self.static_kwargs,
             "x": x,

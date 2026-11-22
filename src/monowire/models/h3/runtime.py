@@ -29,7 +29,9 @@ class H3Runtime:
         self.rank = self.stage.group.rank_in_group
         self.topology = self.stage.transformer.topology
         self.ingress_replicas = self.topology.ingress_replicas
-        self.channels = create_channels(self.topology, self.pipeline.device)
+        self.channels = create_channels(
+            self.topology, self.pipeline.device, async_transport=config.async_transport
+        )
         self.on_stage_event = None
 
     @contextmanager
@@ -60,6 +62,7 @@ class H3Runtime:
             self.channels,
             batch_size=self.config.downstream_batch_size,
             on_event=self.on_stage_event,
+            async_transport=self.config.async_transport,
         )
 
     def close(self):

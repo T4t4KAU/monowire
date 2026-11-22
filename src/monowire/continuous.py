@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .async_utils import await_completion
@@ -16,9 +16,18 @@ class ContinuousConfig:
     max_active_requests: int = 32
     microbatch_size: int = 8
     downstream_batch_size: int = 8
+    async_transport: bool = field(default=True, kw_only=True)
+    prefix_buffer_batches: int = field(default=2, kw_only=True)
 
     def __post_init__(self):
-        sizes = (self.max_active_requests, self.microbatch_size, self.downstream_batch_size)
+        if type(self.async_transport) is not bool:
+            raise ValueError("async_transport must be a boolean")
+        sizes = (
+            self.max_active_requests,
+            self.microbatch_size,
+            self.downstream_batch_size,
+            self.prefix_buffer_batches,
+        )
         if any(type(size) is not int or size < 1 for size in sizes):
             raise ValueError("Request capacity and batch size must be positive")
         if self.microbatch_size > self.max_active_requests:
@@ -78,7 +87,7 @@ class ContinuousScheduler:
         if self.closing:
             raise RuntimeError("Scheduler is closing")
         if self.task is None:
-            self._executor_failure = self.executor.start()
+            self._executor_failure = self.executor.start(on_capacity=self.wakeup.set)
             self._executor_failure.add_done_callback(self._wake)
             self.failure_signal = asyncio.get_running_loop().create_future()
             self.task = asyncio.create_task(self._run())
@@ -154,8 +163,16 @@ class ContinuousScheduler:
         bucket.append((request, prepared))
         self._event("prefix_ready", request_id=request.key, step=prepared.step)
 
+    def _can_prepare(self):
+        queued = sum(len(bucket) for bucket in self.ready.values())
+        return queued + self.config.microbatch_size <= (
+            self.config.prefix_buffer_batches * self.config.microbatch_size
+        )
+
     def _prepare_batch(self):
         """Run one ingress batch, then let dispatched work advance before the next."""
+        if not self._can_prepare():
+            return
         while self.ingress:
             compatibility, bucket = self.ingress.popitem(last=False)
             members = self._take_batch(bucket)
@@ -210,7 +227,7 @@ class ContinuousScheduler:
             self._start_io(request, "admit", self.adapter.admit(request.key, request.value))
 
     def _complete_io(self):
-        for task in [task for task in self.io_tasks if task.done()]:
+        for task in [task for task in self.io_tasks if task.done()][: self.config.microbatch_size]:
             request, phase = self.io_tasks.pop(task)
             try:
                 result = task.result()
@@ -226,6 +243,8 @@ class ContinuousScheduler:
     def _dispatch(self):
         for key, bucket in list(self.ready.items()):
             while bucket:
+                if not key[0] and not self.executor.can_submit:
+                    break
                 members = self._take_batch(bucket)
                 if not members:
                     continue
@@ -250,10 +269,13 @@ class ContinuousScheduler:
                         requests=[(prepared.request_id, prepared.step) for _, prepared in members],
                         hit=key[0],
                     )
-            self.ready.pop(key, None)
+            if not bucket:
+                self.ready.pop(key, None)
 
     def _complete(self):
-        for future in [future for future in self.tasks if future.done()]:
+        for future in [future for future in self.tasks if future.done()][
+            : self.config.microbatch_size
+        ]:
             request, prepared = self.tasks.pop(future)
             request.inflight = False
             try:
@@ -284,11 +306,16 @@ class ContinuousScheduler:
                 self._complete_io()
                 self._complete()
                 self._admit()
+                self._dispatch()
                 self._prepare_batch()
                 self._dispatch()
                 if self.closing and not self._has_work():
                     break
-                if self.ingress:
+                if (
+                    (self.ingress and self._can_prepare())
+                    or (self.ready and self.executor.can_submit)
+                    or any(task.done() for task in (*self.tasks, *self.io_tasks))
+                ):
                     await asyncio.sleep(0)
                 else:
                     await self.wakeup.wait()

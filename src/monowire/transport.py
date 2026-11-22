@@ -10,7 +10,13 @@ from dataclasses import dataclass
 
 import torch
 
-from .channels import SHUTDOWN_TIMEOUT, BufferedSender, ready_event, record_stream
+from .channels import (
+    SHUTDOWN_TIMEOUT,
+    BufferedSender,
+    InFlightQueue,
+    ready_event,
+    record_stream,
+)
 from .interfaces import PipelineFailure, StageAdapter
 from .topology import PipelineTopology
 
@@ -27,13 +33,11 @@ class PipelineExecutor:
         self.next_ticket = 0
         self.receiver = None
         self.sender = None
-        self.send_lock = asyncio.Lock()
-        self.publications = set()
         self.failure = None
         self.failure_signal = None
         self.closed = False
 
-    def start(self):
+    def start(self, *, on_capacity=None):
         """Keep the return/control channel live for the entire service lifetime."""
         self._check_open()
         if self.failure_signal is None:
@@ -44,6 +48,11 @@ class PipelineExecutor:
                     self.channels[self.rank, self.topology.ingress_replicas],
                     self.topology.buffer_size,
                     on_error=lambda error: loop.call_soon_threadsafe(self._fail, error),
+                    on_capacity=(
+                        (lambda: loop.call_soon_threadsafe(on_capacity))
+                        if on_capacity is not None
+                        else None
+                    ),
                 )
                 self.receiver = loop.create_task(self._receive())
         return self.failure_signal
@@ -81,37 +90,56 @@ class PipelineExecutor:
 
     async def _receive(self):
         channel = self.channels[self.topology.world_size - 1, self.rank]
-        while True:
+        loop = asyncio.get_running_loop()
+        credits = threading.BoundedSemaphore(self.topology.buffer_size)
+
+        def deliver(received):
             try:
-                message = await asyncio.to_thread(channel.recv)
-            except Exception as error:
-                self._fail(error)
-                return
-            try:
+                message = received.on_current_stream()
                 if message.get("stop"):
                     if not self.closed or self.waiting:
                         self._fail(RuntimeError("Suffix stopped before ingress closed and drained"))
-                    return
-                self._deliver(message)
+                else:
+                    self._deliver(message)
             except Exception as error:
-                # A protocol error fails requests but still drains the link,
-                # so peers can finish their STOP handshake without timing out.
+                # Continue draining after a protocol error so peers can STOP.
                 self._fail(error)
             finally:
-                del message
+                credits.release()
 
-    async def _send_items(self, items, ready):
-        try:
-            async with self.send_lock:
-                await asyncio.to_thread(self.sender.submit, {"items": items}, ready)
-        except Exception as error:
-            self._fail(error)
+        def receive_loop():
+            while True:
+                # Pending deliveries count against capacity until the owner
+                # consumes them. I/O can advance independently of its event loop.
+                credits.acquire()
+                try:
+                    received = channel.recv()
+                    if received.ready is not None:
+                        # Never insert an unfinished return's dependency ahead
+                        # of unrelated computation on the owner's CUDA stream.
+                        received.ready.synchronize()
+                except Exception as error:
+                    credits.release()
+                    loop.call_soon_threadsafe(self._fail, error)
+                    return
+                loop.call_soon_threadsafe(deliver, received)
+                if isinstance(received.value, dict) and received.value.get("stop"):
+                    return
+
+        await asyncio.to_thread(receive_loop)
+
+    @property
+    def can_submit(self):
+        """The sole publisher checks capacity before exporting a miss batch."""
+        return self.sender is None or not self.sender.queue.full()
 
     def submit(self, prepared):
         """Launch one physical batch and return independent completion futures."""
         self.start()
         if not prepared:
             raise ValueError("Cannot submit an empty physical batch")
+        if not prepared[0].hit and not self.can_submit:
+            raise BufferError("Reserve send capacity before computing another miss batch")
         self.stage.validate(prepared)
         if any(p.hit != prepared[0].hit for p in prepared):
             raise ValueError("A physical batch must have one cache route")
@@ -138,9 +166,10 @@ class PipelineExecutor:
             self.next_ticket += 1
             self.waiting[ticket] = future
             item["ticket"] = ticket
-        task = loop.create_task(self._send_items(items, ready_event(self.stage.group.device)))
-        self.publications.add(task)
-        task.add_done_callback(self.publications.discard)
+        try:
+            self.sender.submit_nowait({"items": items}, ready_event(self.stage.group.device))
+        except Exception as error:
+            self._fail(error)
         return futures
 
     async def close(self):
@@ -153,14 +182,11 @@ class PipelineExecutor:
         self.closed = True
         if not self.topology.edges:
             return
-        # Even after a remote failure, drain published sends before STOP.
+        # The sender owns every published packet and drains it before STOP.
         try:
-            await asyncio.gather(*self.publications)
+            await asyncio.to_thread(self.sender.close)
         finally:
-            try:
-                await asyncio.to_thread(self.sender.close)
-            finally:
-                await self.receiver
+            await self.receiver
         if self.failure is not None:
             raise self.failure
 
@@ -172,6 +198,7 @@ class _ReceivedPacket:
     owner: int
     message: dict
     credit: threading.BoundedSemaphore | None
+    ready: torch.cuda.Event | None = None
 
     def release(self):
         if self.credit is not None:
@@ -190,11 +217,12 @@ def _receive_packets(channel, incoming, owner, draining, capacity):
                 credit = credits
                 break
         try:
-            message = channel.recv()
+            received = channel.recv()
+            message, ready = received.value, received.ready
             stop = message.get("stop")
         except Exception as error:
-            message, stop = {"failure": str(error)}, True
-        packet = _ReceivedPacket(owner, message, credit)
+            message, stop, ready = {"failure": str(error)}, True, None
+        packet = _ReceivedPacket(owner, message, credit, ready)
         while not draining.is_set():
             try:
                 incoming.put(packet, timeout=0.1)
@@ -210,20 +238,28 @@ def _receive_packets(channel, incoming, owner, draining, capacity):
 
 
 def serve_stage(
-    stage: StageAdapter, topology: PipelineTopology, channels, *, batch_size: int, on_event=None
+    stage: StageAdapter,
+    topology: PipelineTopology,
+    channels,
+    *,
+    batch_size: int,
+    on_event=None,
+    async_transport=True,
 ):
     """Serve a suffix stage until all upstream peers have drained and sent STOP.
 
     Packing and model errors fail only the affected requests. Transport failures
     stop the service and notify downstream peers before draining the links.
     """
-    _StageService(stage, topology, channels, batch_size, on_event).run()
+    _StageService(
+        stage, topology, channels, batch_size, on_event, async_transport=async_transport
+    ).run()
 
 
 class _StageService:
     """Own one suffix actor's receive credits, batching and I/O worker lifetime."""
 
-    def __init__(self, stage, topology, channels, batch_size, on_event):
+    def __init__(self, stage, topology, channels, batch_size, on_event, *, async_transport=True):
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError("Downstream batch size must be a positive integer")
         self.stage = stage
@@ -234,6 +270,7 @@ class _StageService:
             raise ValueError("Ingress owns a request scheduler")
         self.batch_size = batch_size
         self.on_event = on_event
+        self.async_transport = async_transport
         self.sources = (
             list(range(self.first_rank)) if self.rank == self.first_rank else [self.rank - 1]
         )
@@ -262,6 +299,7 @@ class _StageService:
         }
         self.stopped = set()
         self.pending = deque()
+        self.computations = InFlightQueue(topology.buffer_size)
 
     def run(self):
         for thread in self.receivers:
@@ -269,6 +307,7 @@ class _StageService:
         failure = None
         try:
             while len(self.stopped) < len(self.sources) or self.pending:
+                self.computations.reserve()
                 envelope = self._next_batch()
                 if envelope is not None:
                     self._process_batch(envelope)
@@ -308,6 +347,8 @@ class _StageService:
                     item["owner"] = received.owner
                 self.pending.append(received)
                 received = None  # Keep the credit until every item is consumed.
+            elif received.ready is not None:
+                received.ready.wait()
             return message
         finally:
             if received is not None:
@@ -332,16 +373,28 @@ class _StageService:
 
     def _pack_pending_batch(self):
         """Merge compatible requests across owners, preserving each packet's credit."""
-        compatibility = self.pending[0].message["items"][0]["compatibility"]
+        # Choose the oldest GPU-ready packet, not merely the oldest descriptor.
+        # Once an older transfer completes it regains priority on the next pass.
+        available = [p for p in self.pending if p.ready is None or p.ready.query()]
+        selected_packet = available[0] if available else self.pending[0]
+        compatibility = selected_packet.message["items"][0]["compatibility"]
         items = []
         for _ in range(len(self.pending)):
             received = self.pending.popleft()
+            if available and received.ready is not None and not received.ready.query():
+                self.pending.append(received)
+                continue
             remaining = []
+            selected = False
             for item in received.message["items"]:
                 if item["compatibility"] == compatibility and len(items) < self.batch_size:
                     items.append(item)
+                    selected = True
                 else:
                     remaining.append(item)
+            if selected and received.ready is not None:
+                received.ready.wait()
+                received.ready = None  # Later slices use the same compute stream.
             received.message["items"] = remaining
             if remaining:
                 self.pending.append(received)
@@ -372,18 +425,21 @@ class _StageService:
                 )
             except Exception:
                 logging.getLogger("monowire").exception("Stage event observer failed")
-        if not envelope.get("error"):
-            try:
-                self.stage.compute(packet)
-            except Exception as error:
-                envelope["error"] = f"Pipeline stage {self.rank}: {error}"
-        ready = ready_event(self.stage.group.device)
+        try:
+            if not envelope.get("error"):
+                try:
+                    self.stage.compute(packet)
+                except Exception as error:
+                    envelope["error"] = f"Pipeline stage {self.rank}: {error}"
+        finally:
+            ready = ready_event(self.stage.group.device)
+            self.computations.track(ready, envelope)
         if self.rank == self.last_rank:
             self._return_results(envelope, ready)
         else:
             self.senders[self.rank + 1].submit(envelope, ready)
-        if ready is not None:
-            ready.synchronize()
+        if not self.async_transport:
+            self.computations.drain()
 
     def _return_results(self, envelope, ready):
         """Split the final hidden states back into per-owner completion messages."""
@@ -415,6 +471,10 @@ class _StageService:
         # and send STOP. Receivers discard queued work until those STOPs arrive.
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT
         errors = []
+        try:
+            self.computations.drain()
+        except Exception as error:
+            errors.append(error)
         for thread in self.receivers:
             thread.join(timeout=max(0, deadline - time.monotonic()))
             if thread.is_alive():

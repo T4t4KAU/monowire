@@ -259,7 +259,7 @@ class H3CacheRoutingTests(unittest.TestCase):
                         output = await executor.submit([hit])[0]
                         self.assertTrue(outgoing.messages.empty())
                         closing = asyncio.create_task(executor.close())
-                        self.assertTrue((await asyncio.to_thread(outgoing.recv))["stop"])
+                        self.assertTrue((await asyncio.to_thread(outgoing.recv)).value["stop"])
                         returning.send({"stop": True})
                         await closing
                         return output

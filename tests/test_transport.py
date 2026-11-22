@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from monowire.channels import close_channels, create_channels
+from monowire.channels import ReceivedMessage, close_channels, create_channels
 from monowire.continuous import PreparedStep
 from monowire.topology import PipelineTopology
 from monowire.transport import PipelineExecutor, _ReceivedPacket, serve_stage
@@ -45,7 +45,7 @@ class RoutedStage:
         return packet
 
 
-def routed_worker(rank, store, cuda):
+def routed_worker(rank, store, cuda, async_transport=True):
     device = torch.device(f"cuda:{rank}" if cuda else "cpu")
     if cuda:
         torch.cuda.set_device(device)
@@ -57,12 +57,14 @@ def routed_worker(rank, store, cuda):
         timeout=timedelta(seconds=60),
     )
     topology = PipelineTopology((1, 1, 1), 2, buffer_size=1)
-    channels = create_channels(topology, device)
+    channels = create_channels(topology, device, async_transport=async_transport)
     stage = RoutedStage(rank, device)
     events = []
 
     async def run():
         executor = PipelineExecutor(stage, topology, channels)
+        capacity = asyncio.Event()
+        executor.start(on_capacity=capacity.set)
 
         def request(i, hit=False):
             return PreparedStep(
@@ -74,9 +76,14 @@ def routed_worker(rank, store, cuda):
             )
 
         batches = [[request(i), request(i + 1)] for i in range(0, 8 if rank == 0 else 16, 2)]
-        results = await asyncio.wait_for(
-            asyncio.gather(*(asyncio.gather(*executor.submit(batch)) for batch in batches)), 30
-        )
+        pending = []
+        for batch in batches:
+            while not executor.can_submit:
+                capacity.clear()
+                if not executor.can_submit:
+                    await asyncio.wait_for(capacity.wait(), 30)
+            pending.append(asyncio.gather(*executor.submit(batch)))
+        results = await asyncio.wait_for(asyncio.gather(*pending), 30)
         for batch, outputs in zip(batches, results, strict=True):
             for item, output in zip(batch, outputs, strict=True):
                 torch.testing.assert_close(output, item.payload + 8)
@@ -103,7 +110,14 @@ def routed_worker(rank, store, cuda):
                 if rank < 2:
                     asyncio.run(run())
                 else:
-                    serve_stage(stage, topology, channels, batch_size=2, on_event=events.append)
+                    serve_stage(
+                        stage,
+                        topology,
+                        channels,
+                        batch_size=2,
+                        on_event=events.append,
+                        async_transport=async_transport,
+                    )
                     assert events and all(1 <= e["batch"] <= 2 for e in events)
                     assert sum(e["batch"] for e in events) == 26
                 dist.barrier()
@@ -243,12 +257,13 @@ class RoutedTransportTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.device_count() >= 4, "Requires four CUDA devices")
     def test_nccl_two_owners_shared_suffix(self):
-        with tempfile.TemporaryDirectory() as folder:
-            mp.spawn(routed_worker, args=(str(Path(folder, "store")), True), nprocs=4)
+        for enabled in (False, True):
+            with self.subTest(async_transport=enabled), tempfile.TemporaryDirectory() as folder:
+                mp.spawn(routed_worker, args=(str(Path(folder, "store")), True, enabled), nprocs=4)
 
 
 class MemoryChannel:
-    """FIFO test link with the same blocking send/recv contract as Gloo."""
+    """FIFO test link returning immediately ready messages."""
 
     def __init__(self):
         self.messages = queue.Queue()
@@ -257,13 +272,61 @@ class MemoryChannel:
         self.messages.put(message)
 
     def recv(self):
-        return self.messages.get(timeout=3)
+        return ReceivedMessage(self.messages.get(timeout=3))
 
     def heartbeat(self):
         pass
 
+    def drain(self):
+        pass
+
 
 class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_return_receiver_prefetches_with_bounded_capacity_while_owner_is_busy(self):
+        entered, second, third = threading.Event(), threading.Event(), threading.Event()
+
+        class ObservedChannel(MemoryChannel):
+            count = 0
+
+            def recv(self):
+                entered.set()
+                message = super().recv()
+                if "items" in message.value:
+                    self.count += 1
+                    if self.count == 2:
+                        second.set()
+                    if self.count == 3:
+                        third.set()
+                return message
+
+        outgoing, returning = MemoryChannel(), ObservedChannel()
+        executor = PipelineExecutor(
+            RoutedStage(0, "cpu"),
+            PipelineTopology((1, 1), buffer_size=2),
+            {(0, 1): outgoing, (1, 0): returning},
+        )
+        executor.start()
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        futures = executor.submit(
+            [PreparedStep(str(i), 0, False, "toy", torch.ones(1, 2)) for i in range(3)]
+        )
+        outgoing.recv()
+        for ticket in range(3):
+            returning.send({"items": [{"ticket": ticket, "hidden": torch.tensor(ticket)}]})
+        try:
+            # Keep the owner busy while the I/O thread reads two messages. The
+            # third must wait for an owner callback to release receive capacity.
+            self.assertTrue(second.wait(1))
+            self.assertFalse(third.wait(0.03))
+            self.assertFalse(any(future.done() for future in futures))
+        finally:
+            outputs = await asyncio.wait_for(asyncio.gather(*futures), 2)
+            closing = asyncio.create_task(executor.close())
+            self.assertTrue((await asyncio.to_thread(outgoing.recv)).value["stop"])
+            returning.send({"stop": True})
+            await asyncio.wait_for(closing, 2)
+        self.assertEqual([value.item() for value in outputs], [0, 1, 2])
+
     async def test_service_failure_drains_stop_while_packet_credit_is_held(self):
         class StageAbort(BaseException):
             pass
@@ -297,8 +360,8 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     2,
                 )
         self.assertTrue(incoming.messages.empty())
-        self.assertIn("stage aborted", returning.recv()["failure"])
-        self.assertTrue(returning.recv()["stop"])
+        self.assertIn("stage aborted", returning.recv().value["failure"])
+        self.assertTrue(returning.recv().value["stop"])
 
     async def test_partial_packet_holds_receive_credit_until_all_items_are_consumed(self):
         entered, resume = threading.Event(), threading.Event()
@@ -312,7 +375,7 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             def recv(self):
                 message = super().recv()
-                if "items" in message:
+                if "items" in message.value:
                     received[self.owner] += 1
                 return message
 
@@ -361,7 +424,7 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(event["batch"] <= 8 for event in events))
         for owner in range(2):
             tickets = []
-            while not (message := links[2, owner].recv()).get("stop"):
+            while not (message := links[2, owner].recv().value).get("stop"):
                 for item in message["items"]:
                     tickets.append(item["ticket"])
                     torch.testing.assert_close(item["hidden"], torch.full((1, 2), 4.0))
@@ -405,7 +468,7 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(error, PipelineFailure)
         self.assertIsInstance(error.__cause__, AttributeError)
         closing = asyncio.create_task(executor.close())
-        self.assertTrue((await asyncio.to_thread(outgoing.recv))["stop"])
+        self.assertTrue((await asyncio.to_thread(outgoing.recv)).value["stop"])
         returning.send({"stop": True})
         with self.assertRaises(PipelineFailure):
             await asyncio.wait_for(closing, 1)
@@ -425,7 +488,7 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(await asyncio.wait_for(asyncio.shield(failure), 1), PipelineFailure)
         with self.assertRaisesRegex(PipelineFailure, "Suffix stopped"):
             await executor.close()
-        self.assertTrue(outgoing.recv()["stop"])
+        self.assertTrue(outgoing.recv().value["stop"])
 
     async def test_response_split_preserves_independent_success_and_failure(self):
         topology = PipelineTopology((1, 1))
@@ -435,7 +498,9 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         requests = [PreparedStep(str(i), 0, False, "toy", torch.ones(1, 2)) for i in range(2)]
         first, second = executor.submit(requests)
-        packet = await asyncio.to_thread(outgoing.recv)
+        # Deliberately keep the event loop busy: the sender must still publish
+        # the packet, without a coroutine resuming to release a send lock.
+        packet = outgoing.recv().value
         a, b = packet["items"]
         returning.send({"items": [{"ticket": b["ticket"], "hidden": torch.tensor(7)}]})
         self.assertEqual((await asyncio.wait_for(asyncio.shield(second), 1)).item(), 7)
@@ -444,7 +509,7 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "only first failed"):
             await first
         closing = asyncio.create_task(executor.close())
-        self.assertTrue((await asyncio.to_thread(outgoing.recv))["stop"])
+        self.assertTrue((await asyncio.to_thread(outgoing.recv)).value["stop"])
         returning.send({"stop": True})
         await asyncio.wait_for(closing, 1)
 
@@ -503,7 +568,7 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_sender_failure_is_joined_and_reported(self):
         from monowire.channels import BufferedSender
 
-        class BrokenChannel:
+        class BrokenChannel(MemoryChannel):
             def send(self, *args):
                 raise OSError("link failed")
 
@@ -523,12 +588,12 @@ class ExecutorLifecycleTests(unittest.IsolatedAsyncioTestCase):
             RoutedStage(0, "cpu"), topology, {(0, 1): outgoing, (1, 0): returning}
         )
         future = executor.submit([PreparedStep("bad", 0, False, "toy", torch.ones(1, 2))])[0]
-        item = (await asyncio.to_thread(outgoing.recv))["items"][0]
+        item = (await asyncio.to_thread(outgoing.recv)).value["items"][0]
         returning.send({"items": [{"ticket": item["ticket"]}]})  # Missing output payload.
         with self.assertRaises(PipelineFailure):
             await asyncio.wait_for(asyncio.shield(future), 1)
         closing = asyncio.create_task(executor.close())
-        self.assertTrue((await asyncio.to_thread(outgoing.recv))["stop"])
+        self.assertTrue((await asyncio.to_thread(outgoing.recv)).value["stop"])
         returning.send({"stop": True})
         with self.assertRaisesRegex(RuntimeError, "communication failed"):
             await asyncio.wait_for(closing, 1)

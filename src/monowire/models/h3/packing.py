@@ -2,6 +2,8 @@
 
 import torch
 
+from ...tensor_payload import SharedTensor, TensorParts
+
 
 def validate_block_kwargs(arguments):
     if arguments.get("vdn_window") is not None:
@@ -10,9 +12,26 @@ def validate_block_kwargs(arguments):
 
 def pack_requests(items):
     """Pack request-local hidden rows and metadata; preserve boundaries for splitting."""
-    packet = dict(pack_block_kwargs([item["arguments"] for item in items]))
+    packet = dict(
+        pack_block_kwargs(
+            [
+                {
+                    **item["arguments"],
+                    "rope_table": item.get("shared_rope", item["arguments"]["rope_table"]),
+                }
+                for item in items
+            ]
+        )
+    )
     rows = [item["hidden"] for item in items]
     packet["hidden"] = torch.cat(rows)
+    keys = [item["adaln_key"] for item in items]
+    # A partial/missing key must never identify a complete packed embedding.
+    packet["adaln_key"] = (
+        (keys[0] if len(keys) == 1 else tuple(keys))
+        if all(key is not None for key in keys)
+        else None
+    )
     return packet, [hidden.shape[0] for hidden in rows]
 
 
@@ -42,7 +61,11 @@ def pack_block_kwargs(arguments):
     return {
         "t_emb": torch.cat([args["t_emb"] for args in arguments], dim=0),
         "combined_indices": torch.cat(combined, dim=0),
-        "rope_table": torch.cat([args["rope_table"] for args in arguments], dim=0),
+        "rope_table": (
+            TensorParts(tuple(args["rope_table"] for args in arguments))
+            if any(isinstance(args["rope_table"], SharedTensor) for args in arguments)
+            else torch.cat([args["rope_table"] for args in arguments], dim=0)
+        ),
         "cu_seqlens": torch.cat(
             [
                 *cumulative,

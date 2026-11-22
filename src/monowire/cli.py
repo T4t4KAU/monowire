@@ -14,6 +14,12 @@ def main():
     parser.add_argument("--ingress-replicas", type=int, default=1)
     parser.add_argument("--stage-layers", type=int, nargs="+")
     parser.add_argument("--downstream-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--async-transport",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Grouped transfers and deferred CUDA completion waits (enabled by default)",
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="Maximum concurrent requests")
     parser.add_argument(
         "--microbatch-size",
@@ -75,6 +81,7 @@ def main():
             max_active_requests=args.batch_size,
             microbatch_size=args.microbatch_size,
             downstream_batch_size=args.downstream_batch_size,
+            async_transport=args.async_transport,
         ),
         cache=CacheConfig(
             args.cache,

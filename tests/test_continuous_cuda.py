@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.multiprocessing as mp
@@ -34,6 +35,7 @@ def worker(rank, size, store):
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm_omni.diffusion.models.minimax_h3.adaln_cache import MiniMaxH3RuntimeAdalnCache
 
     torch.cuda.set_device(rank)
     init_distributed_environment(
@@ -47,7 +49,7 @@ def worker(rank, size, store):
     transformer = torch.nn.Module()
     transformer.pp_group = get_pp_group()
     transformer.start_layer, transformer.end_layer = rank, rank + 1
-    transformer.adaln_cache = None
+    transformer.adaln_cache = MiniMaxH3RuntimeAdalnCache()
     transformer.blocks = torch.nn.ModuleList([Block(i + 1) for i in range(size)])
 
     def prepared(key, value, hit=False):
@@ -61,6 +63,7 @@ def worker(rank, size, store):
             combined_indices=torch.zeros(3, dtype=torch.long, device=hidden.device),
             rope_table=hidden.new_zeros(3, 2),
         )
+        transformer.adaln_cache.prepare(args["t_emb"])
         return PreparedStep(
             key,
             0,
@@ -69,6 +72,7 @@ def worker(rank, size, store):
             dict(
                 hidden=hidden,
                 arguments=args,
+                adaln_key=transformer.adaln_cache.prepared_key(args["t_emb"]),
                 transformer=transformer,
                 next_layer=0,
                 entry=SimpleNamespace(residual=torch.ones_like(hidden) * 10),
@@ -80,10 +84,20 @@ def worker(rank, size, store):
 
     async def run():
         executor = PipelineExecutor(H3StageAdapter(transformer), topology, channels)
-        tasks = [
-            asyncio.gather(*executor.submit([prepared(f"{i}a", i), prepared(f"{i}b", i + 1)]))
-            for i in range(4)
-        ]
+        capacity = asyncio.Event()
+        executor.start(on_capacity=capacity.set)
+        tasks = []
+        for i in range(4):
+            while not executor.can_submit:
+                capacity.clear()
+                if not executor.can_submit:
+                    await asyncio.wait_for(capacity.wait(), 60)
+            batch = [prepared(f"{i}a", i), prepared(f"{i}b", i + 1)]
+            with patch(
+                "vllm_omni.diffusion.cache.exact_projection_cache.tensor_digest",
+                side_effect=AssertionError("Ingress rehashed prepared embeddings"),
+            ):
+                tasks.append(asyncio.gather(*executor.submit(batch)))
         hit = await asyncio.gather(*executor.submit([prepared("hit", 100, True)]))
         torch.testing.assert_close(hit[0], torch.full_like(hit[0], 110))
         for i, task in enumerate(tasks):
@@ -99,7 +113,11 @@ def worker(rank, size, store):
             if rank == 0:
                 asyncio.run(run())
             else:
-                serve_stage(H3StageAdapter(transformer), topology, channels, batch_size=8)
+                with patch(
+                    "vllm_omni.diffusion.cache.exact_projection_cache.tensor_digest",
+                    side_effect=AssertionError("Suffix rehashed transported embeddings"),
+                ):
+                    serve_stage(H3StageAdapter(transformer), topology, channels, batch_size=8)
     finally:
         close_channels(channels)
         destroy_model_parallel()
