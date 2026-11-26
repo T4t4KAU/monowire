@@ -28,6 +28,7 @@ class ImageCLITests(unittest.TestCase):
             ("--prompt", "one", "--prompt", "two", "--image", "unused.png"),
             ("--prompt", "scene", "--image", "/missing/monowire-image.png"),
             ("--prompt", "scene", "--encoder-stage-layers", "50"),
+            ("--prompt", "scene", "--overlap-encoder-dit"),
             ("--prompt", "scene", "--phased", "--ingress-replicas", "2"),
             (
                 "--prompt",

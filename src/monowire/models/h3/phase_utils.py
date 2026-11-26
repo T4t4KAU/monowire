@@ -1,11 +1,22 @@
 """CPU handoffs and encoder partition validation, independent of native imports."""
 
+from dataclasses import fields, is_dataclass, replace
+
 import torch
 
 
 def cpu_tree(value):
     if isinstance(value, torch.Tensor):
         return value.detach().cpu()
+    if is_dataclass(value) and not isinstance(value, type):
+        return replace(
+            value,
+            **{
+                field.name: cpu_tree(getattr(value, field.name))
+                for field in fields(value)
+                if field.init
+            },
+        )
     if isinstance(value, dict):
         return {key: cpu_tree(item) for key, item in value.items()}
     if isinstance(value, list):

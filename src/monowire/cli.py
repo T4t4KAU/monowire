@@ -21,6 +21,11 @@ def main():
         "--phased", action="store_true", help="Finite job: Qwen PP, VAE encode, DiT PP, VAE decode"
     )
     parser.add_argument(
+        "--overlap-encoder-dit",
+        action="store_true",
+        help="With --phased, switch each drained Qwen stage to DiT independently",
+    )
+    parser.add_argument(
         "--encoder-stage-layers",
         type=int,
         nargs="+",
@@ -73,6 +78,8 @@ def main():
     args = parser.parse_args()
     if args.pp < 1:
         parser.error("--pp must be positive")
+    if args.overlap_encoder_dit and not args.phased:
+        parser.error("--overlap-encoder-dit requires --phased")
     if args.encoder_stage_layers and not args.phased:
         parser.error("--encoder-stage-layers requires --phased")
     if args.phased and args.ingress_replicas != 1:
@@ -122,7 +129,10 @@ def main():
         from .models.h3.phased import create_phased_engine
 
         factory = create_phased_engine
-        options = {"encoder_stage_layers": args.encoder_stage_layers}
+        options = {
+            "encoder_stage_layers": args.encoder_stage_layers,
+            "overlap_encoder_dit": args.overlap_encoder_dit,
+        }
     engine = factory(
         args.model,
         pp_size=args.pp,

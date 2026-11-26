@@ -118,11 +118,12 @@ class QwenPPEncoder(native.MiniMaxH3Qwen3VLEncoder):
         return self.text_model(hidden.unsqueeze(0), positions)[0].contiguous()
 
 
-def run_encoder_pipeline(stage, inputs, lengths, device_group, cpu_group):
+def run_encoder_pipeline(stage, inputs, lengths, device_group, cpu_group, *, on_output=None):
     """Clocked 1F pipeline: one request per stage, bounded activation handoffs.
 
-    Only rank 0 supplies inputs; last-stage outputs remain on CPU until the
-    pipeline drains, then return over Gloo. All ranks call this finite-job API.
+    With on_output, the last rank publishes each CPU tensor immediately and each
+    rank returns after its final handoff. The caller owns rolling output transport.
+    Without it, preserve the barrier baseline and return all outputs on rank 0.
     """
     import torch.distributed as dist
 
@@ -136,7 +137,7 @@ def run_encoder_pipeline(stage, inputs, lengths, device_group, cpu_group):
     old_cudnn = torch.backends.cuda.cudnn_sdp_enabled()
     torch.backends.cuda.enable_cudnn_sdp(True)
     try:
-        for tick in range(count + world - 1):
+        for tick in range(count + (rank if on_output is not None else world - 1)):
             index = tick - rank
             outgoing = None
             if 0 <= index < count:
@@ -147,7 +148,12 @@ def run_encoder_pipeline(stage, inputs, lengths, device_group, cpu_group):
                     hidden, positions = current
                     outgoing = (stage.continuation(hidden, positions), positions)
                 if rank == world - 1:
-                    outputs.append(outgoing[0].cpu())
+                    tensor = outgoing[0].cpu()
+                    if on_output is None:
+                        outputs.append(tensor)
+                    else:
+                        on_output(index, tensor)
+                    del tensor
             incoming = None
             incoming_index = tick - rank + 1
             operations = []
@@ -170,7 +176,8 @@ def run_encoder_pipeline(stage, inputs, lengths, device_group, cpu_group):
                 for work in dist.batch_isend_irecv(operations):
                     work.wait()
             current = incoming
-        # This baseline intentionally has a phase barrier; rolling handoff follows later.
+        if on_output is not None:
+            return []
         if world > 1:
             if rank == world - 1:
                 for tensor in outputs:

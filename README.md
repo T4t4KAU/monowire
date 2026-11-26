@@ -122,5 +122,27 @@ For Python, use `create_phased_engine(...)` and `engine.generate(prompts, sampli
 on every rank. Rank 0 returns CPU outputs with the original request IDs; other
 ranks return an empty list. `engine.phase_events` reports phase time (including
 loading), peak allocated GPU memory and remaining allocation after release.
-The API accepts finite jobs, not an unbounded stream. This version has explicit
-phase barriers; Qwen drain / DiT loading overlap is not enabled yet.
+The API accepts finite jobs, not an unbounded stream. The default retains phase
+barriers for comparison.
+
+Add `--overlap-encoder-dit` (Python: `overlap_encoder_dit=True`) to enable rolling
+Qwen → DiT handoff. This mode encodes image/audio conditions first, prepares each
+rank's DiT weights in CPU RAM and creates communication groups before Qwen runs.
+The Qwen tail returns each completed request immediately over a dedicated Gloo
+group. Each rank releases its Qwen weights after its final activation handoff,
+copies its own DiT weights to GPU, and begins serving without a global drain or
+weight-ready barrier. Rank 0 consumes available conditions through the existing
+continuous scheduler; downstream stages accept activations once locally ready.
+VAE decoding still waits for DiT to finish.
+
+This mode additionally needs CPU RAM for all partitioned DiT weights (about
+62 GiB total for the native checkpoint), alongside Qwen loading and job tensors.
+The CPU inbox can retain the finite job's entire text conditioning; GPU handoffs
+remain bounded. There is no disk spill or host-memory admission budget. Weight
+copies on different GPUs may run concurrently; overlap is not a guarantee of
+speedup. `engine.timeline_events` records local Qwen release, per-request output
+arrival, DiT copy start/completion and compute events using the host monotonic
+clock (direct cross-rank comparison requires the same host). In overlap mode,
+the `dit` phase excludes CPU preload/GPU copying and its end allocation precedes
+DiT release; `dit_weights_released` records the allocation after release. Measure the
+whole `generate()` call for end-to-end comparisons.

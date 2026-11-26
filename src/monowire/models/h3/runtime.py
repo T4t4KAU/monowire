@@ -16,7 +16,7 @@ from .validation import validate_runtime
 
 
 class H3Runtime:
-    def __init__(self, worker, config):
+    def __init__(self, worker, config, *, channels=None):
         self.worker = worker
         self.config = config
         self.pipeline = worker.model_runner.pipeline
@@ -29,8 +29,12 @@ class H3Runtime:
         self.rank = self.stage.group.rank_in_group
         self.topology = self.stage.transformer.topology
         self.ingress_replicas = self.topology.ingress_replicas
-        self.channels = create_channels(
-            self.topology, self.pipeline.device, async_transport=config.async_transport
+        self.channels = (
+            channels
+            if channels is not None
+            else create_channels(
+                self.topology, self.pipeline.device, async_transport=config.async_transport
+            )
         )
         self.on_stage_event = None
 

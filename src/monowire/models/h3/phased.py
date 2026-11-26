@@ -1,5 +1,6 @@
 """Finite H3 jobs: Qwen PP, media encoding, DiT PP, then VAE decoding."""
 
+import asyncio
 import gc
 import json
 import logging
@@ -25,12 +26,23 @@ class PhasedH3Engine:
     """All ranks call generate with a common finite job; only rank 0 returns outputs.
 
     Phase tensors live in CPU RAM. No model weights survive a phase boundary.
-    This baseline uses barriers, not overlapping encoder/DiT weight loading.
+    Optional rolling handoff overlaps local DiT loading with Qwen drain.
     """
 
     def __init__(
-        self, model, *, pp_size, config, cache, topology, encoder_stage_layers, trust_remote_code
+        self,
+        model,
+        *,
+        pp_size,
+        config,
+        cache,
+        topology,
+        encoder_stage_layers,
+        trust_remote_code,
+        overlap_encoder_dit=False,
     ):
+        self.overlap_encoder_dit = overlap_encoder_dit
+        self.timeline_events = []
         self.model = str(model)
         self.pp_size = pp_size
         self.config, self.cache, self.topology = config, cache, topology
@@ -63,8 +75,20 @@ class PhasedH3Engine:
             raise RuntimeError(status[0])
         return result
 
-    def _phase(self, name, operation):
-        dist.barrier(group=self.cpu_group)
+    def _mark(self, name, **values):
+        event = {"event": name, "rank": self.rank, "time": time.monotonic(), **values}
+        self.timeline_events.append(event)
+        logger.info("MonoWire timeline %s", json.dumps(event))
+
+    def _dit_event(self, event):
+        self._mark(
+            "dit_" + event["event"],
+            **{key: value for key, value in event.items() if key not in {"event", "time", "rank"}},
+        )
+
+    def _phase(self, name, operation, *, barrier=True):
+        if barrier:
+            dist.barrier(group=self.cpu_group)
         torch.cuda.reset_peak_memory_stats(self.worker.device)
         start = time.perf_counter()
         result = operation()
@@ -177,7 +201,7 @@ class PhasedH3Engine:
             tags.append(token_tags.cpu())
         return prepared, inputs, tags
 
-    def _encode_text(self, inputs, lengths):
+    def _encode_text(self, inputs, lengths, *, on_output=None):
         from transformers import Qwen3VLConfig
 
         from .encoder_pp import QwenPPEncoder, run_encoder_pipeline
@@ -187,19 +211,18 @@ class PhasedH3Engine:
         stage = QwenPPEncoder(config, self.encoder_stage_layers, self.rank, self.worker.device)
         try:
             stage.load_checkpoint(path)
-            return run_encoder_pipeline(stage, inputs, lengths, self.device_group, self.cpu_group)
+            self._mark("qwen_compute_start")
+            return run_encoder_pipeline(
+                stage, inputs, lengths, self.device_group, self.cpu_group, on_output=on_output
+            )
         finally:
             # Frozen weights are discarded, never copied back to the host.
             del stage
 
-    def _encode_media(self, prepared, hidden, tags):
+    def _encode_media(self, prepared, hidden=None, tags=None):
         from vllm_omni.diffusion.models.minimax_h3.vae import (
             MiniMaxH3AudioVAE,
             MiniMaxH3VideoVAE,
-        )
-        from vllm_omni.model_executor.models.minimax_h3.conditioning import (
-            MiniMaxH3EncoderConditioning,
-            MiniMaxH3TextConditioning,
         )
         from vllm_omni.model_executor.models.minimax_h3.encoder_processing import encode_media
 
@@ -220,23 +243,33 @@ class PhasedH3Engine:
                     encode_only=True,
                     trust_remote_code=self.trust_remote_code,
                 )
-            for item, states, token_tags in zip(prepared, hidden, tags, strict=True):
+            for index, item in enumerate(prepared):
                 media = encode_media(
                     item.media, video_vae=video_vae, audio_vae=audio_vae, emit_conditioning=True
                 )
-                conditioning = MiniMaxH3EncoderConditioning.from_components(
-                    MiniMaxH3TextConditioning(states, token_tags), media
-                )
+                media = cpu_tree(media)
                 outputs.append(
-                    {
-                        "additional_information": {
-                            "encoder_output": cpu_tree(conditioning.to_omni_payload()),
-                        }
-                    }
+                    media
+                    if hidden is None
+                    else self._conditioning_payload(hidden[index], tags[index], media)
                 )
             return outputs
         finally:
             del video_vae, audio_vae
+
+    @staticmethod
+    def _conditioning_payload(states, tags, media):
+        from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+            MiniMaxH3EncoderConditioning,
+            MiniMaxH3TextConditioning,
+        )
+
+        conditioning = MiniMaxH3EncoderConditioning.from_components(
+            MiniMaxH3TextConditioning(states, tags), media
+        )
+        return {
+            "additional_information": {"encoder_output": cpu_tree(conditioning.to_omni_payload())}
+        }
 
     def _denoise(self, encoded, sampling):
         from vllm.config import LoadConfig
@@ -257,6 +290,99 @@ class PhasedH3Engine:
             # Keep distributed groups alive for the next phase, drop all DiT owners.
             self.worker.model_runner.pipeline = None
             del engine, runtime, loader
+
+    def _generate_overlap(self, prepared, inputs, tags, lengths, sampling):
+        from vllm.config import LoadConfig
+        from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+        from ...channels import CHANNEL_TIMEOUT, close_channels, create_channels
+        from .rolling import EncoderInbox
+
+        # FL2VA image conditions must exist before Qwen drain starts.
+        media = self._phase(
+            "vae_encode", lambda: self._leader(lambda: self._encode_media(prepared))
+        )
+        loader = DiffusersPipelineLoader(LoadConfig(), od_config=self.worker.od_config)
+        channels = inbox = output_group = runtime = engine = None
+        try:
+            # Checkpoint I/O is outside the drain window. Only the local GPU copy
+            # starts after this rank's final Qwen activation handoff completes.
+            self._mark("dit_cpu_load_start")
+            self.worker.model_runner.pipeline = loader.load_model(
+                load_device="cpu", device=self.worker.device
+            )
+            if any(p.is_cuda for p in self.worker.model_runner.pipeline.transformer.parameters()):
+                raise RuntimeError("DiT preload must leave all weights on CPU")
+            self._mark("dit_cpu_ready")
+            channels = create_channels(
+                self.worker.model_runner.pipeline.transformer.topology,
+                self.worker.device,
+                async_transport=self.config.async_transport,
+            )
+            output_group = dist.new_group(backend="gloo", timeout=CHANNEL_TIMEOUT)
+            if self.is_ingress:
+                inbox = EncoderInbox(
+                    lengths,
+                    5120,
+                    self.pp_size - 1,
+                    output_group,
+                    on_output=lambda index: self._mark("condition_received", request_id=str(index)),
+                )
+
+            def publish(index, tensor):
+                self._mark("qwen_output", request_id=str(index))
+                if self.pp_size == 1:
+                    inbox.publish(index, tensor)
+                else:
+                    dist.send(tensor, dst=0, group=output_group)
+
+            self._phase("qwen_pp", lambda: self._encode_text(inputs, lengths, on_output=publish))
+            self._mark("qwen_released", allocated_bytes=torch.cuda.memory_allocated())
+            self._mark("dit_gpu_load_start")
+            runtime = H3Runtime(self.worker, self.config, channels=channels)
+            torch.cuda.synchronize(self.worker.device)
+            self._mark("dit_gpu_ready")
+            runtime.on_stage_event = self._dit_event
+            engine = ContinuousEngine(runtime, self.config)
+            engine.on_event = self._dit_event
+
+            async def requests():
+                if not self.is_ingress:
+                    return
+                async for index, hidden in inbox.tensors():
+                    payload = self._conditioning_payload(hidden, tags[index], media[index])
+                    media[index] = None
+                    yield str(index), payload, sampling
+
+            async def collect():
+                return [output async for output in engine.stream(requests())]
+
+            # No collective between local encoder release and DiT serving.
+            outputs = self._phase("dit", lambda: asyncio.run(collect()), barrier=False)
+        finally:
+            try:
+                if inbox is not None:
+                    inbox.close()
+            finally:
+                try:
+                    if runtime is not None:
+                        runtime.close(shutdown_worker=False)
+                    elif channels is not None:
+                        close_channels(channels)
+                finally:
+                    try:
+                        if output_group is not None:
+                            dist.destroy_process_group(output_group)
+                    finally:
+                        self.worker.model_runner.pipeline = None
+                        engine = runtime = loader = None
+                        gc.collect()
+                        torch.cuda.empty_cache()
+        self._mark("dit_weights_released", allocated_bytes=torch.cuda.memory_allocated())
+        return (
+            self._phase("vae_decode", lambda: self._leader(lambda: self._decode(outputs, sampling)))
+            or []
+        )
 
     def _decode(self, outputs, sampling):
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder import (
@@ -297,6 +423,7 @@ class PhasedH3Engine:
             raise RuntimeError("Phased engine must be open and idle")
         self.running = True
         self.phase_events = []
+        self.timeline_events = []
         try:
             self._make_worker()
             # H3Runtime's context only needs the worker; no DiT is constructed here.
@@ -307,6 +434,10 @@ class PhasedH3Engine:
                 dist.broadcast_object_list(header, src=0, group=self.cpu_group)
                 if not header[0]:
                     return []
+                if self.overlap_encoder_dit:
+                    return self._generate_overlap(
+                        prepared, inputs, tags, header[0], sampling_params
+                    )
                 hidden = self._phase("qwen_pp", lambda: self._encode_text(inputs, header[0]))
                 encoded = self._phase(
                     "vae_encode",
@@ -350,6 +481,7 @@ def create_phased_engine(
     topology=None,
     encoder_stage_layers=None,
     trust_remote_code=False,
+    overlap_encoder_dit=False,
 ):
     """Construct a lazy finite-job engine for a local native FL2VA checkpoint."""
     validate_runtime(pp_size)
@@ -368,4 +500,5 @@ def create_phased_engine(
         topology=topology,
         encoder_stage_layers=encoder_stage_layers,
         trust_remote_code=trust_remote_code,
+        overlap_encoder_dit=overlap_encoder_dit,
     )
