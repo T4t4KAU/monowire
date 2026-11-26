@@ -42,6 +42,14 @@ class H3RequestAdapter:
             raise
 
     def prepare(self, state):
+        """Queue only request state; allocate hidden rows when a batch has capacity.
+
+        This adapter serves one t2va transformer. Ragged lengths and different
+        timesteps can share its packed batch, so they do not split this queue.
+        """
+        return PreparedStep(state.request_id, state.step_index, False, id(self.pipeline), state)
+
+    def _prepare_step(self, state):
         from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
 
         transformer = state.extra[native._STEP_TRANSFORMER]
@@ -73,10 +81,10 @@ class H3RequestAdapter:
             video_target_timesteps=video_times,
             audio_target_timesteps=audio_times,
         )
-        continuation = transformer.iter_transformer_forward(**inputs)
+        block_inputs = transformer.prepare_transformer_forward(**inputs)
         prepared = prepare_transformer_step(
             transformer,
-            continuation,
+            block_inputs,
             state.request_id,
             state.step_index,
             len(state.extra[native._STEP_SIGMAS_VIDEO]) - 1,
@@ -102,13 +110,9 @@ class H3RequestAdapter:
             transformer.adaln_cache.prepare_from_key(
                 payload["arguments"]["t_emb"], payload["adaln_key"]
             )
-        try:
-            payload["continuation"].send(output)
-        except StopIteration as complete:
-            velocities = complete.value
-        else:
-            raise RuntimeError("Unexpected extra transformer yield")
-        video_velocity, audio_velocity = velocities
+        video_velocity, audio_velocity = transformer.finish_transformer_forward(
+            output, **payload["output_context"]
+        )
         state.extra[native._STEP_AUDIO_NOISE_PRED] = audio_velocity
         self.pipeline.step_scheduler(state, video_velocity)
         if cache_entry is not None:
@@ -120,7 +124,7 @@ class H3RequestAdapter:
             )
 
     def prepare_batch(self, prepared):
-        return prepare_transformer_batch(prepared)
+        return prepare_transformer_batch([self._prepare_step(item.payload) for item in prepared])
 
     def finished(self, state):
         return state.denoise_completed
@@ -143,11 +147,11 @@ class H3RequestAdapter:
         state.latents = None
 
 
-def prepare_transformer_step(transformer, continuation, request_id, step, total_steps):
+def prepare_transformer_step(transformer, block_inputs, request_id, step, total_steps):
     """Prepare request-local embeddings and metadata without executing any blocks."""
     if transformer.start_layer != 0:
         raise ValueError("Request preparation requires the first pipeline stage")
-    hidden, arguments = next(continuation)
+    hidden, arguments, output_context = block_inputs
     arguments = dict(arguments)
     validate_block_kwargs(arguments)
     cache = transformer.request_cache
@@ -170,7 +174,7 @@ def prepare_transformer_step(transformer, continuation, request_id, step, total_
         "probe_end": probe_end,
         "total_steps": total_steps,
         "transformer": transformer,
-        "continuation": continuation,
+        "output_context": output_context,
         "adaln_key": (
             transformer.adaln_cache.prepared_key(arguments["t_emb"])
             if transformer.adaln_cache is not None
@@ -289,7 +293,7 @@ class H3StageAdapter:
         else:
             packet, lengths = self.pack(prepared)
             outputs = packet["hidden"].split(lengths)
-        return [
+        exported = [
             {
                 "hidden": hidden,
                 "arguments": {
@@ -303,6 +307,11 @@ class H3StageAdapter:
             }
             for item, hidden in zip(prepared, outputs, strict=True)
         ]
+        for item in prepared:
+            if item.payload["entry"] is None:
+                # Transport owns the packet. Only cached misses need an anchor.
+                del item.payload["hidden"]
+        return exported
 
     def combine_requests(self, items):
         packet, _ = pack_requests(items)

@@ -2,6 +2,7 @@
 
 import asyncio
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -46,21 +47,21 @@ def transformer(policy, end=6, threshold=0.17, probe_blocks=()):
 def raw_prepare(model, step, value=1.0, key="request", timestep=0.0, tokens=2):
     hidden = torch.full((tokens, 3), float(value))
 
-    def continuation():
-        yield (
-            hidden,
-            dict(
-                num_requests=1,
-                t_emb=torch.full((1, 4), timestep),
-                packed_total=tokens,
-                max_seqlen=tokens,
-                cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32),
-                combined_indices=torch.zeros(tokens, dtype=torch.long),
-                rope_table=torch.zeros(tokens, 4),
-            ),
-        )
+    block_inputs = (
+        hidden,
+        dict(
+            num_requests=1,
+            t_emb=torch.full((1, 4), timestep),
+            packed_total=tokens,
+            max_seqlen=tokens,
+            cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32),
+            combined_indices=torch.zeros(tokens, dtype=torch.long),
+            rope_table=torch.zeros(tokens, 4),
+        ),
+        {},
+    )
 
-    return prepare_transformer_step(model, continuation(), key, step, 12)
+    return prepare_transformer_step(model, block_inputs, key, step, 12)
 
 
 def prepare(model, step, value=1.0, key="request"):
@@ -87,6 +88,31 @@ def full_evaluation(model, prepared):
 
 
 class H3CacheRoutingTests(unittest.TestCase):
+    def test_no_cache_export_releases_original_hidden(self):
+        model = transformer("none")
+        prepared = raw_prepare(model, 0)
+        original = weakref.ref(prepared.payload["hidden"])
+        with torch.inference_mode():
+            exported = H3StageAdapter(model).export_requests([prepared])
+        self.assertIsNone(original())
+        self.assertNotIn("hidden", prepared.payload)
+        self.assertIn("output_context", prepared.payload)
+        torch.testing.assert_close(exported[0]["hidden"], torch.full((2, 3), 22.0))
+
+    def test_cached_miss_retains_residual_anchor(self):
+        for policy in ("first_block", "first_stage"):
+            with self.subTest(policy=policy), torch.inference_mode():
+                model = transformer(policy)
+                prepared = prepare(model, 0)
+                anchor = weakref.ref(prepared.payload["hidden"])
+                exported = H3StageAdapter(model).export_requests([prepared])
+                self.assertIs(anchor(), prepared.payload["hidden"])
+                suffix_output = exported[0]["hidden"]
+                for block in model.blocks[model.end_layer :]:
+                    suffix_output = block(suffix_output)
+                reconstructed = anchor() + (suffix_output - anchor())
+                torch.testing.assert_close(reconstructed, torch.full((2, 3), 37.0))
+
     def test_stage_exit_export_keeps_existing_rows_without_repacking(self):
         model = transformer("first_stage")
         prepared = prepare_transformer_batch(

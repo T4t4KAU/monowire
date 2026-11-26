@@ -1759,23 +1759,12 @@ class MiniMaxH3DiTModel(nn.Module):
         return hidden
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        stages = self.iter_transformer_forward(**kwargs)
-        hidden, block_kwargs = next(stages)
+        hidden, block_kwargs, output_context = self.prepare_transformer_forward(**kwargs)
         hidden = self.run_transformer_blocks(hidden, **block_kwargs)
-        try:
-            stages.send(hidden)
-        except StopIteration as complete:
-            return complete.value
-        raise RuntimeError("H3 transformer forward yielded more than one block stage")
+        return self.finish_transformer_forward(hidden, **output_context)
 
-    def iter_transformer_forward(self, **kwargs: Any):
-        """Packed inference forward.
-
-        Keyword names follow the checkpoint's serving contract.
-        Returns `(video_logits, audio_logits)` from rows selected by
-        `img_pos_for_infer_output_info` and `audio_pos_info`, with condition
-        rows zeroed by update masks.
-        """
+    def prepare_transformer_forward(self, **kwargs: Any):
+        """Build block inputs and only the context needed by the output head."""
         # Strict keyword contract: refuse any kwarg forward does not consume.
         unexpected = sorted(set(kwargs) - _FORWARD_SUPPORTED_KWARGS)
         if unexpected:
@@ -1888,7 +1877,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_rope,
                 block_combined,
             )
-        hidden = yield (
+        return (
             hidden,
             dict(
                 t_emb=t_emb,
@@ -1902,7 +1891,37 @@ class MiniMaxH3DiTModel(nn.Module):
                 vsa_prefix_segments=vsa_prefix_segments,
                 vdn_window=vdn_window,
             ),
+            dict(
+                t_emb=t_emb,
+                inverse_indices=inverse_indices,
+                local_start=local_start,
+                local_len=local_len,
+                seq_len=seq_len,
+                infer_out_pos=infer_out_pos,
+                audio_pos=audio_pos,
+                update_mask=update_mask,
+                skip_mask_out_condition=skip_mask_out_condition,
+                update_audio_mask=kwargs.get("update_audio_mask"),
+            ),
         )
+
+    def finish_transformer_forward(
+        self,
+        hidden,
+        *,
+        t_emb,
+        inverse_indices,
+        local_start,
+        local_len,
+        seq_len,
+        infer_out_pos,
+        audio_pos,
+        update_mask,
+        skip_mask_out_condition,
+        update_audio_mask,
+    ):
+        """Project completed block output without retaining its original input."""
+        device = hidden.device
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
             video_logits, audio_logits = self.final_layer(
@@ -1939,7 +1958,6 @@ class MiniMaxH3DiTModel(nn.Module):
             # Audio has no condition rows in the supported tasks, so its
             # derived update mask is all ones. Honor an explicit mask when
             # provided.
-            update_audio_mask = kwargs.get("update_audio_mask")
             if update_audio_mask is not None:
                 audio_logits = audio_logits * update_audio_mask.view(-1).unsqueeze(-1)
         return video_logits, audio_logits

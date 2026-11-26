@@ -122,8 +122,10 @@ class PipelineExecutor:
                     credits.release()
                     loop.call_soon_threadsafe(self._fail, error)
                     return
+                stop = isinstance(received.value, dict) and received.value.get("stop")
                 loop.call_soon_threadsafe(deliver, received)
-                if isinstance(received.value, dict) and received.value.get("stop"):
+                del received  # The callback owns it, not the next blocking receive.
+                if stop:
                     return
 
         await asyncio.to_thread(receive_loop)
@@ -219,6 +221,7 @@ def _receive_packets(channel, incoming, owner, draining, capacity):
         try:
             received = channel.recv()
             message, ready = received.value, received.ready
+            del received  # Transfer ownership to the packet below.
             stop = message.get("stop")
         except Exception as error:
             message, stop, ready = {"failure": str(error)}, True, None
