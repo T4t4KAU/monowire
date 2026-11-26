@@ -22,10 +22,15 @@ class H3RequestAdapter:
 
         prompt, sampling = value
         extra = sampling.extra_args or {}
-        _, media = self.pipeline._extract_prompt(prompt)
-        task = self.pipeline._resolve_task(
-            extra.get("task"), media, audio_mode=extra.get("audio_mode", "native")
-        )
+        if self.pipeline.load_text_encoder or self.pipeline.load_vae_encoder:
+            _, media = self.pipeline._extract_prompt(prompt)
+            task = self.pipeline._resolve_task(
+                extra.get("task"), media, audio_mode=extra.get("audio_mode", "native")
+            )
+        else:
+            task = self.pipeline._resolve_task(
+                self.pipeline._extract_encoder_conditioning(prompt).task
+            )
         if task not in {"t2va", "fl2va"}:
             raise ValueError("Continuous H3 supports t2va and fl2va requests only")
         if (sampling.extra_args or {}).get("sampler", "euler") != "euler":
@@ -139,6 +144,10 @@ class H3RequestAdapter:
     async def finish(self, state):
         output = await self.io.run(self.pipeline.post_decode, state)
         record_stream(output)
+        if getattr(output, "to_cpu", False):
+            from .phase_utils import cpu_tree
+
+            output.output = cpu_tree(output.output)
         return output
 
     async def close(self):

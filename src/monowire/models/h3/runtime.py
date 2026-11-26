@@ -65,13 +65,14 @@ class H3Runtime:
             async_transport=self.config.async_transport,
         )
 
-    def close(self):
+    def close(self, *, shutdown_worker=True):
         try:
             if self.channels is not None:
                 close_channels(self.channels)
         finally:
             self.channels = None
-            self.worker.shutdown()
+            if shutdown_worker:
+                self.worker.shutdown()
 
 
 def create_continuous_engine(

@@ -17,6 +17,15 @@ def main():
         "--task", choices=("t2va", "fl2va"), help="Defaults to fl2va with images, otherwise t2va"
     )
     parser.add_argument("--pp", type=int, default=8)
+    parser.add_argument(
+        "--phased", action="store_true", help="Finite job: Qwen PP, VAE encode, DiT PP, VAE decode"
+    )
+    parser.add_argument(
+        "--encoder-stage-layers",
+        type=int,
+        nargs="+",
+        help="Qwen PP layers per GPU (sum 50; first stage at least 3)",
+    )
     parser.add_argument("--ingress-replicas", type=int, default=1)
     parser.add_argument("--stage-layers", type=int, nargs="+")
     parser.add_argument("--downstream-batch-size", type=int, default=8)
@@ -64,6 +73,17 @@ def main():
     args = parser.parse_args()
     if args.pp < 1:
         parser.error("--pp must be positive")
+    if args.encoder_stage_layers and not args.phased:
+        parser.error("--encoder-stage-layers requires --phased")
+    if args.phased and args.ingress_replicas != 1:
+        parser.error("--phased currently requires --ingress-replicas 1")
+    if args.phased:
+        from .models.h3.phase_utils import encoder_partition
+
+        try:
+            encoder_partition(args.pp, args.encoder_stage_layers)
+        except ValueError as error:
+            parser.error(str(error))
     task = args.task or ("fl2va" if args.image else "t2va")
     if task == "fl2va" and not args.image:
         parser.error("--task fl2va requires --image")
@@ -96,7 +116,14 @@ def main():
         else None
     )
 
-    engine = create_continuous_engine(
+    factory = create_continuous_engine
+    options = {"cpu_offload": args.cpu_offload}
+    if args.phased:
+        from .models.h3.phased import create_phased_engine
+
+        factory = create_phased_engine
+        options = {"encoder_stage_layers": args.encoder_stage_layers}
+    engine = factory(
         args.model,
         pp_size=args.pp,
         topology=topology,
@@ -113,8 +140,8 @@ def main():
             args.cache_max_skip,
             probe_blocks=tuple(args.cache_probe_blocks),
         ),
-        cpu_offload=args.cpu_offload,
         trust_remote_code=args.trust_remote_code,
+        **options,
     )
     try:
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams

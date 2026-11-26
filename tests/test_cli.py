@@ -27,6 +27,20 @@ class ImageCLITests(unittest.TestCase):
             ("--prompt", "scene", "--task", "t2va", "--image", "unused.png"),
             ("--prompt", "one", "--prompt", "two", "--image", "unused.png"),
             ("--prompt", "scene", "--image", "/missing/monowire-image.png"),
+            ("--prompt", "scene", "--encoder-stage-layers", "50"),
+            ("--prompt", "scene", "--phased", "--ingress-replicas", "2"),
+            (
+                "--prompt",
+                "scene",
+                "--phased",
+                "--pp",
+                "4",
+                "--encoder-stage-layers",
+                "2",
+                "16",
+                "16",
+                "16",
+            ),
         )
         for options in cases:
             with (

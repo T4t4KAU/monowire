@@ -90,3 +90,37 @@ For first-and-last-frame conditioning in Python, pass
 `"image": [first_rgb_image, last_rgb_image]`; native H3 assigns frame indices
 `[0, -1]`. The CLI accepts one first-frame image per request.
 REF2VA remains unsupported. Run `monowire --help` for all options.
+
+### Finite jobs with separate model phases
+
+`--phased` runs the entire finite job as Qwen-VL layer PP → VAE encoding →
+DiT PP → VAE decoding. Conditions and generated latents are retained in CPU RAM;
+model weights are released at phase boundaries. Qwen weights are partitioned by
+layer, with vision, embeddings and the first three DeepStack injections on rank 0.
+The encoder preserves H3's unnormalized layer-50 output and multimodal positions.
+There is no encoder TP in this mode.
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m monowire.cli \
+  --phased --pp 4 --model /path/to/FL2VA \
+  --encoder-stage-layers 13 13 12 12 --stage-layers 6 14 15 15 \
+  --prompt "Animate this scene naturally." --image /path/to/first.png \
+  --height 384 --width 672 --aspect-ratio 16:9 --frames 124 --steps 20 \
+  --batch-size 2 --microbatch-size 2 --trust-remote-code \
+  --output outputs/phased.pt
+```
+
+This baseline requires a local native `FL2VA` checkpoint directory and one DiT
+ingress. It supports T2VA and first/last-frame FL2VA, with Euler sampling and
+original weights. Editing, timeline guides and continuation/refinement are not
+supported. `--cpu-offload` is unnecessary in phased mode: codecs and DiT do not
+co-reside. CPU RAM must hold the finite job's conditions, latents and outputs.
+Each phase's weights, activations and communication buffers still must fit on
+its GPUs; this example is not a 4090 throughput or memory guarantee.
+
+For Python, use `create_phased_engine(...)` and `engine.generate(prompts, sampling)`
+on every rank. Rank 0 returns CPU outputs with the original request IDs; other
+ranks return an empty list. `engine.phase_events` reports phase time (including
+loading), peak allocated GPU memory and remaining allocation after release.
+The API accepts finite jobs, not an unbounded stream. This version has explicit
+phase barriers; Qwen drain / DiT loading overlap is not enabled yet.
