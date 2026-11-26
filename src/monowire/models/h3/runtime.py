@@ -20,7 +20,7 @@ class H3Runtime:
         self.worker = worker
         self.config = config
         self.pipeline = worker.model_runner.pipeline
-        self.stage = H3StageAdapter(self.pipeline._transformer_for_task("t2va"))
+        self.stage = H3StageAdapter(self.pipeline.transformer)
         adaln_cache = self.stage.transformer.adaln_cache
         if adaln_cache is not None and adaln_cache.sidecar is not None:
             raise ValueError("Continuous H3 requires the request-independent AdaLN runtime cache")

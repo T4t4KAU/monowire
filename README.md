@@ -37,6 +37,26 @@ torchrun --standalone --nproc-per-node=8 -m monowire.cli \
 
 Repeat `--prompt` to add requests. The native VAE requires `--trust-remote-code`. Results are saved with `torch.save` as request IDs, video/audio outputs, and errors.
 
+For image-and-text-to-video (FL2VA), add one local `--image` per `--prompt`, in
+matching order. The task defaults to `fl2va` when images are provided:
+
+```bash
+torchrun --standalone --nproc-per-node=8 -m monowire.cli \
+  --pp 8 --model /path/to/FL2VA \
+  --prompt "Animate this scene with natural, smooth motion and a steady camera." \
+  --image /path/to/first-frame.png \
+  --height 384 --width 672 --aspect-ratio 16:9 \
+  --frames 124 --steps 20 --seed 42 --cache none \
+  --cpu-offload --trust-remote-code \
+  --output outputs/image-video.pt
+```
+
+Images are converted to RGB; native H3 preprocessing handles resizing and image
+encoding. Each request retains its own image conditions through every Euler step
+and uses native video/audio decoding. This is an API example, not a validated
+4090 memory or throughput configuration: codec weights and activations must fit
+alongside the resident ingress DiT stage even with CPU offload enabled.
+
 | Option | Meaning |
 | --- | --- |
 | `--pp` | Total GPU workers; must match the process count. |
@@ -60,4 +80,13 @@ The first six blocks are replicated on GPUs 0 and 1; the remaining 44 blocks run
 
 For Python, import `create_continuous_engine`, `ContinuousConfig`, `CacheConfig`, and `PipelineTopology` from `monowire`. Use `engine.generate(prompts, sampling_params)` for a finite request list or `engine.stream(source)` for an async source yielding `(request_id, prompt, sampling_params)`. All ranks must participate; `generate` shards the common list across ingress replicas, while `stream` accepts a separate source on each ingress. Close an unfinished stream with `aclose()` before closing the engine.
 
-The current H3 adapter supports dense text-to-audio/video inference with Euler sampling. Run `monowire --help` for all options.
+The H3 adapter supports dense T2VA and FL2VA inference with Euler sampling using
+the original FL2VA checkpoint. In Python, pass
+`{"prompt": text, "multi_modal_data": {"image": rgb_pil_image}}` and set
+`sampling_params.extra_args["task"] = "fl2va"`, or omit the task to let native H3
+infer it from the image. T2VA and FL2VA requests share the same DiT and may be
+batched together; their attention boundaries and conditions stay independent.
+For first-and-last-frame conditioning in Python, pass
+`"image": [first_rgb_image, last_rgb_image]`; native H3 assigns frame indices
+`[0, -1]`. The CLI accepts one first-frame image per request.
+REF2VA remains unsupported. Run `monowire --help` for all options.

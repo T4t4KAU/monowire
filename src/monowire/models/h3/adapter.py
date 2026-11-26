@@ -21,8 +21,13 @@ class H3RequestAdapter:
         from vllm_omni.diffusion.worker.utils import StepRequestState
 
         prompt, sampling = value
-        if (sampling.extra_args or {}).get("task", "t2va") != "t2va":
-            raise ValueError("Continuous H3 currently serves the t2va transformer")
+        extra = sampling.extra_args or {}
+        _, media = self.pipeline._extract_prompt(prompt)
+        task = self.pipeline._resolve_task(
+            extra.get("task"), media, audio_mode=extra.get("audio_mode", "native")
+        )
+        if task not in {"t2va", "fl2va"}:
+            raise ValueError("Continuous H3 supports t2va and fl2va requests only")
         if (sampling.extra_args or {}).get("sampler", "euler") != "euler":
             raise ValueError("Continuous H3 currently supports Euler only")
         if sampling.lora_request is not None:
@@ -36,6 +41,8 @@ class H3RequestAdapter:
             record_stream(state.timesteps)
             record_stream(state.extra)
             record_stream(vars(state.extra[native._STEP_BRANCH]))
+            if state.extra[native._STEP_TRANSFORMER] is not self.pipeline.transformer:
+                raise ValueError("Continuous H3 requests must use the shared FL2VA transformer")
             return state
         except BaseException:
             self.release(state)
@@ -44,8 +51,8 @@ class H3RequestAdapter:
     def prepare(self, state):
         """Queue only request state; allocate hidden rows when a batch has capacity.
 
-        This adapter serves one t2va transformer. Ragged lengths and different
-        timesteps can share its packed batch, so they do not split this queue.
+        T2VA and FL2VA share one transformer. Ragged lengths, image conditions
+        and timesteps remain request-local and can share its packed batch.
         """
         return PreparedStep(state.request_id, state.step_index, False, id(self.pipeline), state)
 

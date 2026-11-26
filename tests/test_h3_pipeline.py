@@ -53,6 +53,10 @@ class H3PipelineTests(unittest.TestCase):
             return torch.nn.Linear(2, 2)
 
         with ExitStack() as stack:
+            # This fixture constructs CPU modules, even in a CUDA-built runtime.
+            stack.enter_context(
+                patch.object(native.current_omni_platform, "is_cuda", return_value=False)
+            )
             stack.enter_context(
                 patch.object(native, "get_tensor_model_parallel_world_size", return_value=1)
             )

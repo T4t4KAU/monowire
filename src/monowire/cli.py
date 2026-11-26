@@ -10,6 +10,12 @@ def main():
     parser.add_argument(
         "--prompt", action="append", required=True, help="Repeat for multiple requests"
     )
+    parser.add_argument(
+        "--image", action="append", help="Local first-frame image; repeat once per --prompt"
+    )
+    parser.add_argument(
+        "--task", choices=("t2va", "fl2va"), help="Defaults to fl2va with images, otherwise t2va"
+    )
     parser.add_argument("--pp", type=int, default=8)
     parser.add_argument("--ingress-replicas", type=int, default=1)
     parser.add_argument("--stage-layers", type=int, nargs="+")
@@ -58,6 +64,23 @@ def main():
     args = parser.parse_args()
     if args.pp < 1:
         parser.error("--pp must be positive")
+    task = args.task or ("fl2va" if args.image else "t2va")
+    if task == "fl2va" and not args.image:
+        parser.error("--task fl2va requires --image")
+    if args.image and task != "fl2va":
+        parser.error("--image requires --task fl2va")
+    if args.image and len(args.image) != len(args.prompt):
+        parser.error("Provide exactly one --image per --prompt, in matching order")
+    prompts = [{"prompt": prompt} for prompt in args.prompt]
+    if args.image:
+        from PIL import Image
+
+        for prompt, filename in zip(prompts, args.image, strict=True):
+            try:
+                with Image.open(filename) as image:
+                    prompt["multi_modal_data"] = {"image": image.convert("RGB")}
+            except (OSError, ValueError) as error:
+                parser.error(f"Cannot load --image {filename!r}: {error}")
     import torch
 
     from .cache import CacheConfig
@@ -98,14 +121,14 @@ def main():
 
         outputs = list(
             engine.generate(
-                [{"prompt": prompt} for prompt in args.prompt],
+                prompts,
                 OmniDiffusionSamplingParams(
                     height=args.height,
                     width=args.width,
                     num_frames=args.frames,
                     num_inference_steps=args.steps,
                     seed=args.seed,
-                    extra_args={"task": "t2va", "aspect_ratio": args.aspect_ratio},
+                    extra_args={"task": task, "aspect_ratio": args.aspect_ratio},
                 ),
             )
         )
