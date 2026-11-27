@@ -1,20 +1,31 @@
 """Continuous H3 pipeline inference; launch one worker per GPU with torchrun."""
 
 import argparse
+import json
 from pathlib import Path
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--prompt", action="append", help="Repeat for multiple requests")
+    source.add_argument(
+        "--requests-json", help="JSON file containing native prompt objects and multi_modal_data"
+    )
+    parser.add_argument("--extra-args", default="{}", help="JSON object of native sampling options")
     parser.add_argument(
-        "--prompt", action="append", required=True, help="Repeat for multiple requests"
+        "--additional-config",
+        default="{}",
+        help="Phased model configuration JSON, e.g. latent_upscaler_path",
     )
     parser.add_argument(
         "--image", action="append", help="Local first-frame image; repeat once per --prompt"
     )
     parser.add_argument(
-        "--task", choices=("t2va", "fl2va"), help="Defaults to fl2va with images, otherwise t2va"
+        "--task",
+        choices=("t2va", "fl2va", "ref2va"),
+        help="Defaults to ref2va for Ref2VA, otherwise fl2va with images or t2va",
     )
     parser.add_argument("--pp", type=int, default=8)
     parser.add_argument(
@@ -91,23 +102,48 @@ def main():
             encoder_partition(args.pp, args.encoder_stage_layers)
         except ValueError as error:
             parser.error(str(error))
-    task = args.task or ("fl2va" if args.image else "t2va")
-    if task == "fl2va" and not args.image:
-        parser.error("--task fl2va requires --image")
-    if args.image and task != "fl2va":
-        parser.error("--image requires --task fl2va")
-    if args.image and len(args.image) != len(args.prompt):
-        parser.error("Provide exactly one --image per --prompt, in matching order")
-    prompts = [{"prompt": prompt} for prompt in args.prompt]
-    if args.image:
-        from PIL import Image
+    try:
+        extra = json.loads(args.extra_args)
+        additional = json.loads(args.additional_config)
+        if not isinstance(extra, dict) or not isinstance(additional, dict):
+            raise ValueError("--extra-args and --additional-config must be JSON objects")
+    except (ValueError, TypeError) as error:
+        parser.error(str(error))
+    if additional and not args.phased:
+        parser.error("--additional-config currently requires --phased")
+    task = args.task or extra.get("task")
+    if args.requests_json:
+        if args.image:
+            parser.error("Use multi_modal_data in --requests-json instead of --image")
+        try:
+            prompts = json.loads(Path(args.requests_json).read_text())
+            if not isinstance(prompts, list) or any(not isinstance(item, dict) for item in prompts):
+                raise ValueError("--requests-json must contain a list of prompt objects")
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+    else:
+        task = task or (
+            "ref2va" if Path(args.model).name == "Ref2VA" else "fl2va" if args.image else "t2va"
+        )
+        if task == "fl2va" and not args.image:
+            parser.error("--task fl2va requires --image")
+        if args.image and task not in {"fl2va", "ref2va"}:
+            parser.error("--image requires --task fl2va or ref2va")
+        if args.image and len(args.image) != len(args.prompt):
+            parser.error("Provide exactly one --image per --prompt, in matching order")
+        prompts = [{"prompt": prompt} for prompt in args.prompt]
+        if args.image:
+            from PIL import Image
 
-        for prompt, filename in zip(prompts, args.image, strict=True):
-            try:
-                with Image.open(filename) as image:
-                    prompt["multi_modal_data"] = {"image": image.convert("RGB")}
-            except (OSError, ValueError) as error:
-                parser.error(f"Cannot load --image {filename!r}: {error}")
+            for prompt, filename in zip(prompts, args.image, strict=True):
+                try:
+                    with Image.open(filename) as image:
+                        prompt["multi_modal_data"] = {"image": image.convert("RGB")}
+                except (OSError, ValueError) as error:
+                    parser.error(f"Cannot load --image {filename!r}: {error}")
+    extra.setdefault("aspect_ratio", args.aspect_ratio)
+    if task is not None:
+        extra["task"] = task
     import torch
 
     from .cache import CacheConfig
@@ -132,6 +168,7 @@ def main():
         options = {
             "encoder_stage_layers": args.encoder_stage_layers,
             "overlap_encoder_dit": args.overlap_encoder_dit,
+            "additional_config": additional,
         }
     engine = factory(
         args.model,
@@ -165,7 +202,7 @@ def main():
                     num_frames=args.frames,
                     num_inference_steps=args.steps,
                     seed=args.seed,
-                    extra_args={"task": task, "aspect_ratio": args.aspect_ratio},
+                    extra_args=extra,
                 ),
             )
         )

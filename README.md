@@ -80,8 +80,8 @@ The first six blocks are replicated on GPUs 0 and 1; the remaining 44 blocks run
 
 For Python, import `create_continuous_engine`, `ContinuousConfig`, `CacheConfig`, and `PipelineTopology` from `monowire`. Use `engine.generate(prompts, sampling_params)` for a finite request list or `engine.stream(source)` for an async source yielding `(request_id, prompt, sampling_params)`. All ranks must participate; `generate` shards the common list across ingress replicas, while `stream` accepts a separate source on each ingress. Close an unfinished stream with `aclose()` before closing the engine.
 
-The H3 adapter supports dense T2VA and FL2VA inference with Euler sampling using
-the original FL2VA checkpoint. In Python, pass
+The H3 adapter supports dense T2VA/FL2VA with the original FL2VA checkpoint and
+Ref2VA with its original Ref2VA checkpoint, using Euler sampling. In Python, pass
 `{"prompt": text, "multi_modal_data": {"image": rgb_pil_image}}` and set
 `sampling_params.extra_args["task"] = "fl2va"`, or omit the task to let native H3
 infer it from the image. T2VA and FL2VA requests share the same DiT and may be
@@ -89,7 +89,8 @@ batched together; their attention boundaries and conditions stay independent.
 For first-and-last-frame conditioning in Python, pass
 `"image": [first_rgb_image, last_rgb_image]`; native H3 assigns frame indices
 `[0, -1]`. The CLI accepts one first-frame image per request.
-REF2VA remains unsupported. Run `monowire --help` for all options.
+Use the matching partition for each job; FL2VA and Ref2VA weights are never
+co-resident. Run `monowire --help` for all options.
 
 ### Finite jobs with separate model phases
 
@@ -101,22 +102,65 @@ The encoder preserves H3's unnormalized layer-50 output and multimodal positions
 There is no encoder TP in this mode.
 
 ```bash
-torchrun --standalone --nproc-per-node=4 -m monowire.cli \
-  --phased --pp 4 --model /path/to/FL2VA \
-  --encoder-stage-layers 13 13 12 12 --stage-layers 6 14 15 15 \
+torchrun --standalone --nproc-per-node=8 -m monowire.cli \
+  --phased --pp 8 --model /path/to/FL2VA \
+  --encoder-stage-layers 7 7 6 6 6 6 6 6 --stage-layers 6 7 7 6 6 6 6 6 \
   --prompt "Animate this scene naturally." --image /path/to/first.png \
   --height 384 --width 672 --aspect-ratio 16:9 --frames 124 --steps 20 \
-  --batch-size 2 --microbatch-size 2 --trust-remote-code \
+  --batch-size 16 --microbatch-size 1 --downstream-batch-size 1 --trust-remote-code \
   --output outputs/phased.pt
 ```
 
-This baseline requires a local native `FL2VA` checkpoint directory and one DiT
-ingress. It supports T2VA and first/last-frame FL2VA, with Euler sampling and
-original weights. Editing, timeline guides and continuation/refinement are not
-supported. `--cpu-offload` is unnecessary in phased mode: codecs and DiT do not
-co-reside. CPU RAM must hold the finite job's conditions, latents and outputs.
+The phased engine accepts a local native `FL2VA` or `Ref2VA` partition directory
+and one DiT ingress. It supports the original dense model with Euler sampling.
+FL2VA accepts first-only `[0]`, last-only `[-1]` and first/last `[0, -1]` images.
+Ref2VA accepts the native image/video/audio references; video grids and timestamps
+are retained through Qwen PP. Native latent-mask editing, timeline guides and
+`audio_mode="lock_source"` use the media VAE phase. `--cpu-offload` is unnecessary
+in phased mode: encoders, DiT and decoders have separate lifetimes. CPU RAM must hold the finite job's conditions, latents and outputs.
 Each phase's weights, activations and communication buffers still must fit on
 its GPUs; this example is not a 4090 throughput or memory guarantee.
+
+Advanced requests use a separate native request execution lane:
+
+- `long_video_mode="continuation"` uses native Ref2VA windows, AV overlap trimming,
+  global temporal positions, and optional `continuation_prompts` (one per window).
+- `latent_refine=0.4` performs a second native denoise pass with its own schedule.
+- `latent_upscale={"scale": 2, "align": 32}` uses a learned upscaler. Supply its
+  checkpoint through `create_phased_engine(..., additional_config={
+  "latent_upscaler_path": "/path/to/upscaler.safetensors"})`. The ingress DiT is
+  offloaded before upscaling and reloaded on the next DiT call. High-resolution
+  FL2VA keyframe conditions are VAE-encoded before Qwen/DiT loading.
+
+Each transformer call in this lane traverses the partitioned DiT. Requests are
+processed serially and use exact forwards without MonoWire residual-cache reuse;
+this lane currently retains Qwen/DiT phase barriers even if
+`overlap_encoder_dit=True`. Ordinary requests keep continuous batching and the
+optional drain overlap. Native incompatibilities still apply, including
+continuation with latent-mask editing or refinement. `quality="high"`, LoRA,
+non-Euler sampling and multiple outputs per request remain outside this contract
+and are rejected before encoding. Use separate requests for multiple seeds.
+
+For complete native media inputs, the CLI accepts `--requests-json requests.json`
+instead of `--prompt`/`--image`, plus `--extra-args` and `--additional-config`
+JSON objects. Media file paths inside JSON are resolved relative to the process
+working directory, just as in the Python API. For example, a Ref2VA job:
+
+```json
+[{"prompt": "Keep the character consistent while the camera moves.",
+  "multi_modal_data": {"image": ["reference.png"]}}]
+```
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m monowire.cli \
+  --phased --pp 4 --model /path/to/Ref2VA --requests-json requests.json \
+  --extra-args '{"task":"ref2va","long_video":true,"long_video_mode":"continuation"}' \
+  --frames 430 --steps 20 --height 384 --width 672 --output outputs/long-video.pt
+```
+
+The mode adapters do not imply qualification on every GPU/checkpoint. Full-size
+Ref2VA, learned upscaling and their combinations need corresponding model assets
+and GPU validation; a missing checkpoint is not replaced with another partition.
 
 For Python, use `create_phased_engine(...)` and `engine.generate(prompts, sampling)`
 on every rank. Rank 0 returns CPU outputs with the original request IDs; other

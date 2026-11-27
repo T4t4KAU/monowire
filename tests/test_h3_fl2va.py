@@ -155,12 +155,13 @@ class FL2VAAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args[1].shape, (2, 4, 1))
         self.assertEqual(self.pipeline.decode.call_count, 3)
 
-    async def test_ref2va_rejected_before_encoding_explicit_or_inferred(self):
+    async def test_ref2va_admitted_only_with_matching_checkpoint(self):
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         for extra, media in (({"task": "ref2va"}, {}), ({}, {"video": object()})):
+            self.pipeline.supported_tasks = {"t2va", "fl2va"}
             with patch.object(self.pipeline, "prepare_encode") as encode:
-                with self.assertRaisesRegex(ValueError, "t2va and fl2va"):
+                with self.assertRaisesRegex(ValueError, "supports"):
                     await self.adapter.admit(
                         "bad",
                         (
@@ -169,6 +170,10 @@ class FL2VAAdapterTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     )
                 encode.assert_not_called()
+        self.pipeline.supported_tasks = {"ref2va"}
+        self.pipeline.partition = "ref2va"
+        state = await self.admit("reference", task="ref2va")
+        self.assertIs(state.extra[self.native._STEP_TRANSFORMER], self.pipeline.transformer)
 
     async def test_native_image_preprocessing_preserves_first_last_order(self):
         from PIL import Image
@@ -228,7 +233,7 @@ class FL2VAAdapterTests(unittest.IsolatedAsyncioTestCase):
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         self.pipeline.load_text_encoder = self.pipeline.load_vae_encoder = False
-        for task in ("t2va", "fl2va"):
+        for task in ("t2va", "fl2va", "ref2va"):
             prompt = self.encoded_prompt(task)
             context = self.prepare_inputs(
                 {"multi_modal_data": {"image": [7.0]}} if task == "fl2va" else {}, None
@@ -255,10 +260,11 @@ class FL2VAAdapterTests(unittest.IsolatedAsyncioTestCase):
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         self.pipeline.load_text_encoder = self.pipeline.load_vae_encoder = False
+        self.pipeline.supported_tasks = {"t2va", "fl2va"}
         cases = (
             ({}, "requires encoder conditioning"),
             ({"additional_information": {"encoder_output": {"invalid": True}}}, "wire requires"),
-            (self.encoded_prompt("ref2va"), "t2va and fl2va"),
+            (self.encoded_prompt("ref2va"), "supports"),
         )
         for prompt, message in cases:
             with patch.object(self.pipeline, "prepare_encode") as encode:

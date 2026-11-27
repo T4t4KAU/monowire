@@ -54,6 +54,55 @@ class ImageCLITests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 2)
             create.assert_not_called()
 
+    def test_native_json_requests_and_sampling_options_reach_phased_engine(self):
+        import json
+
+        engine = Mock(is_ingress=True, ingress_replicas=1)
+        engine.generate.return_value = []
+        prompts = [
+            {
+                "prompt": "scene",
+                "multi_modal_data": {
+                    "image": ["reference.png"],
+                    "timeline_guides": [{"frame_index": 0, "image": "guide.png"}],
+                },
+            }
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            request_file = Path(folder, "requests.json")
+            request_file.write_text(json.dumps(prompts))
+            with (
+                patch(
+                    "monowire.models.h3.phased.create_phased_engine", return_value=engine
+                ) as create,
+                patch.dict(
+                    "sys.modules",
+                    {
+                        "vllm_omni.inputs.data": SimpleNamespace(
+                            OmniDiffusionSamplingParams=SimpleNamespace
+                        )
+                    },
+                ),
+                patch.object(torch, "save"),
+            ):
+                self.invoke(
+                    "--phased",
+                    "--requests-json",
+                    str(request_file),
+                    "--extra-args",
+                    '{"task":"ref2va","latent_refine":0.5}',
+                    "--additional-config",
+                    '{"latent_upscaler_path":"upscaler.safetensors"}',
+                )
+        passed, sampling = engine.generate.call_args.args
+        self.assertEqual(passed, prompts)
+        self.assertEqual(sampling.extra_args["latent_refine"], 0.5)
+        self.assertEqual(sampling.extra_args["task"], "ref2va")
+        self.assertEqual(
+            create.call_args.kwargs["additional_config"],
+            {"latent_upscaler_path": "upscaler.safetensors"},
+        )
+
     def test_images_are_rgb_and_paired_with_their_prompts(self):
         engine = Mock(is_ingress=True, ingress_replicas=1)
         engine.generate.return_value = []

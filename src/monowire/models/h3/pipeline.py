@@ -1,5 +1,6 @@
 """Native vLLM-Omni H3 integration, using its loader, workers and PP group."""
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 
 from vllm.distributed.utils import get_pp_indices
@@ -91,6 +92,22 @@ class MonoWireH3Transformer(MiniMaxH3DiTModel):
 
 class MonoWireH3Pipeline(MiniMaxH3Pipeline):
     _transformer_cls = MonoWireH3Transformer
+
+    @staticmethod
+    def _extract_encoder_conditioning(prompt):
+        from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+            MiniMaxH3EncoderConditioning,
+        )
+
+        if isinstance(prompt, list):
+            prompt = prompt[0] if prompt else None
+        additional = prompt.get("additional_information") if isinstance(prompt, Mapping) else None
+        if isinstance(additional, Mapping) and "monowire_encoder_conditioning" in additional:
+            conditioning = additional["monowire_encoder_conditioning"]
+            if not isinstance(conditioning, MiniMaxH3EncoderConditioning):
+                raise ValueError("MonoWire local handoff requires typed H3 encoder conditioning")
+            return conditioning
+        return MiniMaxH3Pipeline._extract_encoder_conditioning(prompt)
 
     def __init__(self, *, od_config, prefix=""):
         parallel = od_config.parallel_config

@@ -31,8 +31,8 @@ class H3RequestAdapter:
             task = self.pipeline._resolve_task(
                 self.pipeline._extract_encoder_conditioning(prompt).task
             )
-        if task not in {"t2va", "fl2va"}:
-            raise ValueError("Continuous H3 supports t2va and fl2va requests only")
+        if task not in {"t2va", "fl2va", "ref2va"}:
+            raise ValueError("Continuous H3 supports t2va, fl2va and ref2va requests only")
         if (sampling.extra_args or {}).get("sampler", "euler") != "euler":
             raise ValueError("Continuous H3 currently supports Euler only")
         if sampling.lora_request is not None:
@@ -47,7 +47,7 @@ class H3RequestAdapter:
             record_stream(state.extra)
             record_stream(vars(state.extra[native._STEP_BRANCH]))
             if state.extra[native._STEP_TRANSFORMER] is not self.pipeline.transformer:
-                raise ValueError("Continuous H3 requests must use the shared FL2VA transformer")
+                raise ValueError("Continuous H3 requests must use the shared partition transformer")
             return state
         except BaseException:
             self.release(state)

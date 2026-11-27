@@ -232,11 +232,11 @@ class PhaseTests(unittest.TestCase):
     def test_job_phases_and_failure_cleanup(self):
         from unittest.mock import Mock
 
-        for fail in (False, True):
+        for fail in (False, True, "peer"):
             with self.subTest(fail=fail):
                 engine = PhasedH3Engine(
                     "FL2VA",
-                    pp_size=1,
+                    pp_size=2,
                     config=None,
                     cache=None,
                     topology=None,
@@ -260,8 +260,12 @@ class PhaseTests(unittest.TestCase):
                 engine._encode_text = lambda *args: ["hidden"]
                 engine._encode_media = lambda *args: ["encoded"]
                 engine._denoise = Mock(return_value=["latents"])
-                if fail:
+                if fail is True:
                     engine._denoise.side_effect = RuntimeError("denoise failed")
+
+                def gather_errors(errors, local_error, **kwargs):
+                    errors[:] = [local_error, "rank 1: denoise failed" if fail == "peer" else None]
+
                 engine._decode = lambda outputs, sampling: ["decoded"]
                 engine._phase = phase
                 with (
@@ -269,15 +273,22 @@ class PhaseTests(unittest.TestCase):
                         "monowire.models.h3.phased.H3Runtime.context", return_value=nullcontext()
                     ),
                     patch("monowire.models.h3.phased.dist.broadcast_object_list"),
+                    patch(
+                        "monowire.models.h3.phased.dist.all_gather_object",
+                        side_effect=gather_errors,
+                    ) as gather,
                 ):
                     if fail:
                         with self.assertRaisesRegex(RuntimeError, "denoise failed"):
-                            engine.generate(["prompt"], None)
+                            engine.generate(["prompt"], SimpleNamespace(extra_args={}))
                     else:
-                        self.assertEqual(engine.generate(["prompt"], None), ["decoded"])
+                        self.assertEqual(
+                            engine.generate(["prompt"], SimpleNamespace(extra_args={})), ["decoded"]
+                        )
                 self.assertEqual(
                     events, ["qwen_pp", "vae_encode", "dit"] + ([] if fail else ["vae_decode"])
                 )
+                gather.assert_called_once()
                 worker.shutdown.assert_called_once()
                 self.assertIsNone(engine.worker)
                 self.assertFalse(engine.running)
