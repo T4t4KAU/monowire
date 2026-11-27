@@ -201,7 +201,7 @@ class PhasedH3Engine:
             tags.append(token_tags.cpu())
         return prepared, inputs, tags
 
-    def _encode_text(self, inputs, lengths, *, on_output=None):
+    def _encode_text(self, inputs, lengths, *, on_output=None, on_ready=None):
         from transformers import Qwen3VLConfig
 
         from .encoder_pp import QwenPPEncoder, run_encoder_pipeline
@@ -209,11 +209,22 @@ class PhasedH3Engine:
         path = Path(self.model) / "text_encoder"
         config = Qwen3VLConfig.from_pretrained(str(path), local_files_only=True)
         stage = QwenPPEncoder(config, self.encoder_stage_layers, self.rank, self.worker.device)
+
+        def ready():
+            if on_ready is not None:
+                on_ready()
+            self._mark("qwen_compute_start")
+
         try:
             stage.load_checkpoint(path)
-            self._mark("qwen_compute_start")
             return run_encoder_pipeline(
-                stage, inputs, lengths, self.device_group, self.cpu_group, on_output=on_output
+                stage,
+                inputs,
+                lengths,
+                self.device_group,
+                self.cpu_group,
+                on_output=on_output,
+                on_ready=ready,
             )
         finally:
             # Frozen weights are discarded, never copied back to the host.
@@ -302,6 +313,11 @@ class PhasedH3Engine:
         media = self._phase(
             "vae_encode", lambda: self._leader(lambda: self._encode_media(prepared))
         )
+        # These private job lists are also referenced by generate(). Clear their
+        # contents at the last consumer instead of retaining images/pixels while
+        # the full DiT checkpoint and conditioning tensors occupy host memory.
+        if prepared is not None:
+            prepared.clear()
         loader = DiffusersPipelineLoader(LoadConfig(), od_config=self.worker.od_config)
         channels = inbox = output_group = runtime = engine = None
         try:
@@ -336,7 +352,17 @@ class PhasedH3Engine:
                 else:
                     dist.send(tensor, dst=0, group=output_group)
 
-            self._phase("qwen_pp", lambda: self._encode_text(inputs, lengths, on_output=publish))
+            self._phase(
+                "qwen_pp",
+                lambda: self._encode_text(
+                    inputs,
+                    lengths,
+                    on_output=publish,
+                    on_ready=inbox.start if inbox is not None else None,
+                ),
+            )
+            if inputs is not None:
+                inputs.clear()
             self._mark("qwen_released", allocated_bytes=torch.cuda.memory_allocated())
             self._mark("dit_gpu_load_start")
             runtime = H3Runtime(self.worker, self.config, channels=channels)
@@ -351,6 +377,7 @@ class PhasedH3Engine:
                     return
                 async for index, hidden in inbox.tensors():
                     payload = self._conditioning_payload(hidden, tags[index], media[index])
+                    tags[index] = None
                     media[index] = None
                     yield str(index), payload, sampling
 
@@ -385,6 +412,8 @@ class PhasedH3Engine:
         )
 
     def _decode(self, outputs, sampling):
+        if not any(item.error is None for item in outputs):
+            return outputs
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder import (
             MiniMaxH3DecoderPipeline,
         )

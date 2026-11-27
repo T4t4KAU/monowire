@@ -118,7 +118,9 @@ class QwenPPEncoder(native.MiniMaxH3Qwen3VLEncoder):
         return self.text_model(hidden.unsqueeze(0), positions)[0].contiguous()
 
 
-def run_encoder_pipeline(stage, inputs, lengths, device_group, cpu_group, *, on_output=None):
+def run_encoder_pipeline(
+    stage, inputs, lengths, device_group, cpu_group, *, on_output=None, on_ready=None
+):
     """Clocked 1F pipeline: one request per stage, bounded activation handoffs.
 
     With on_output, the last rank publishes each CPU tensor immediately and each
@@ -134,6 +136,8 @@ def run_encoder_pipeline(stage, inputs, lengths, device_group, cpu_group, *, on_
     hidden_dim = native.MINIMAX_H3_QWEN3VL_HIDDEN_DIM
     # Initialize the communicator before a subset enters batched P2P.
     dist.barrier(group=device_group)
+    if on_ready is not None:
+        on_ready()
     old_cudnn = torch.backends.cuda.cudnn_sdp_enabled()
     torch.backends.cuda.enable_cudnn_sdp(True)
     try:

@@ -2,8 +2,11 @@
 
 import asyncio
 import importlib.util
+import sys
 import tempfile
+import time
 import unittest
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -20,7 +23,7 @@ from monowire.models.h3.phased import PhasedH3Engine
 from monowire.models.h3.rolling import EncoderInbox
 
 
-def rolling_encoder_worker(rank, store, count, drained, first_received):
+def rolling_encoder_worker(rank, store, count, drained, first_received, tail_loaded):
     from monowire.models.h3.encoder_pp import run_encoder_pipeline
 
     dist.init_process_group(
@@ -59,7 +62,14 @@ def rolling_encoder_worker(rank, store, count, drained, first_received):
     def publish(index, tensor):
         dist.send(tensor, dst=0, group=output_group)
 
+    def ready():
+        assert tail_loaded.is_set(), "Receiver started before all Qwen stages loaded"
+        inbox.start()
+
     try:
+        if rank == 3:
+            time.sleep(0.1)
+            tail_loaded.set()
         with patch("monowire.models.h3.encoder_pp.native.MINIMAX_H3_QWEN3VL_HIDDEN_DIM", 8):
             run_encoder_pipeline(
                 Stage(),
@@ -68,6 +78,7 @@ def rolling_encoder_worker(rank, store, count, drained, first_received):
                 dist.group.WORLD,
                 dist.group.WORLD,
                 on_output=publish,
+                on_ready=ready if inbox is not None else None,
             )
         if rank == 0:
             drained.set()
@@ -89,6 +100,96 @@ def rolling_encoder_worker(rank, store, count, drained, first_received):
 
 
 class PhaseTests(unittest.TestCase):
+    def test_decode_skips_model_loading_when_no_successful_outputs(self):
+        engine = object.__new__(PhasedH3Engine)
+        for outputs in ([], [SimpleNamespace(error="admission failed")]):
+            with self.subTest(outputs=outputs):
+                # No worker or native runtime exists: returning request errors
+                # must not depend on allocating a VAE successfully.
+                self.assertIs(engine._decode(outputs, None), outputs)
+
+    def test_overlap_releases_spent_inputs_before_loading_next_model(self):
+        engine = PhasedH3Engine(
+            "FL2VA",
+            pp_size=1,
+            config=SimpleNamespace(async_transport=True),
+            cache=None,
+            topology=None,
+            encoder_stage_layers=None,
+            trust_remote_code=False,
+            overlap_encoder_dit=True,
+        )
+        engine.rank = 0
+        engine.worker = SimpleNamespace(model_runner=SimpleNamespace(pipeline=None))
+        prepared, inputs, tags = [torch.ones(1)], [(torch.ones(1), {})], [torch.ones(1)]
+        prepared_ref, input_ref = weakref.ref(prepared[0]), weakref.ref(inputs[0][0])
+        test = self
+        transformer = SimpleNamespace(parameters=lambda: [], topology=None)
+
+        class Loader:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def load_model(self, **kwargs):
+                test.assertIsNone(prepared_ref(), "Raw media retained during DiT CPU preload")
+                return SimpleNamespace(transformer=transformer)
+
+        class Runtime:
+            def __init__(self, *args, **kwargs):
+                test.assertIsNone(input_ref(), "Encoder pixels retained during DiT GPU loading")
+
+            def close(self, **kwargs):
+                pass
+
+        class Continuous:
+            def __init__(self, *args):
+                pass
+
+            async def stream(self, source):
+                async for key, payload, sampling in source:
+                    test.assertIsNone(tags[0])
+                    # The submitted payload must still own its live conditions.
+                    test.assertEqual(payload[0].shape, (1, 5120))
+                    test.assertEqual(payload[1].item(), 1)
+                    yield SimpleNamespace(error=None, output=payload)
+
+        def encode_text(values, lengths, *, on_output, on_ready):
+            test.assertIs(values, inputs)
+            test.assertIsNotNone(input_ref())
+            on_ready()
+            on_output(0, torch.ones((1, 5120)))
+
+        engine._phase = lambda name, operation, **kwargs: operation()
+        engine._leader = lambda operation: operation()
+        engine._encode_media = lambda values: ["encoded media"]
+        engine._encode_text = encode_text
+        engine._conditioning_payload = lambda hidden, tag, media: (hidden, tag, media)
+        engine._decode = lambda outputs, sampling: outputs
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "vllm.config": SimpleNamespace(LoadConfig=lambda: None),
+                    "vllm_omni.diffusion.model_loader.diffusers_loader": SimpleNamespace(
+                        DiffusersPipelineLoader=Loader
+                    ),
+                },
+            ),
+            patch("monowire.models.h3.phased.H3Runtime", Runtime),
+            patch("monowire.models.h3.phased.ContinuousEngine", Continuous),
+            patch("monowire.channels.create_channels", return_value={}),
+            patch("monowire.models.h3.phased.dist.new_group", return_value=object()),
+            patch("monowire.models.h3.phased.dist.destroy_process_group"),
+            patch("torch.cuda.memory_allocated", return_value=0),
+            patch("torch.cuda.synchronize"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            engine.worker.device = "cpu"
+            engine.worker.od_config = None
+            outputs = engine._generate_overlap(prepared, inputs, tags, [1], None)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].output[2], "encoded media")
+
     def test_encoder_partition_keeps_deepstack_on_first_rank(self):
         self.assertEqual(encoder_partition(4), (13, 13, 12, 12))
         for layers in ((2, 16, 16, 16), (13, 13, 12, 11), (0, 20, 15, 15), (25, 25)):
@@ -123,7 +224,7 @@ class PhaseTests(unittest.TestCase):
             return [item async for item in inbox.tensors()]
 
         self.assertEqual(asyncio.run(collect())[0][0], 0)
-        inbox.queue.put(ValueError("broken peer"))
+        inbox._put(ValueError("broken peer"))
         with self.assertRaisesRegex(RuntimeError, "receiver failed"):
             asyncio.run(collect())
         inbox.close()
@@ -189,9 +290,10 @@ class QwenPPTests(unittest.TestCase):
             with self.subTest(count=count), tempfile.TemporaryDirectory() as folder:
                 drained = mp.get_context("spawn").Event()
                 first_received = mp.get_context("spawn").Event()
+                tail_loaded = mp.get_context("spawn").Event()
                 mp.spawn(
                     rolling_encoder_worker,
-                    args=(str(Path(folder, "store")), count, drained, first_received),
+                    args=(str(Path(folder, "store")), count, drained, first_received, tail_loaded),
                     nprocs=4,
                     join=True,
                 )

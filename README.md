@@ -140,9 +140,19 @@ This mode additionally needs CPU RAM for all partitioned DiT weights (about
 The CPU inbox can retain the finite job's entire text conditioning; GPU handoffs
 remain bounded. There is no disk spill or host-memory admission budget. Weight
 copies on different GPUs may run concurrently; overlap is not a guarantee of
-speedup. `engine.timeline_events` records local Qwen release, per-request output
-arrival, DiT copy start/completion and compute events using the host monotonic
-clock (direct cross-rank comparison requires the same host). In overlap mode,
+speedup. On multi-socket hosts, benchmark GPU-local NUMA CPU placement before
+attributing weight-copy stalls to pipeline scheduling. Bind each worker before
+allocating host weights, using only CPUs allowed by the job scheduler. Resolve
+the actual GPU UUID/PCI device rather than assuming CUDA-visible indices match
+physical GPU indices. Compare overlap and barrier runs with the same affinity.
+
+`engine.timeline_events` records local Qwen release, per-request output
+arrival, DiT copy start/completion and scheduler events using the host monotonic
+clock (direct cross-rank comparison requires the same host). `dit_prefix_ready`
+only marks prepared input entering the queue; `dit_dispatched` follows local
+stage submission and can establish that rank 0 launched work before all weights
+were ready. These host events do not measure GPU kernel overlap; use CUDA events
+or a profiler for that. In overlap mode,
 the `dit` phase excludes CPU preload/GPU copying and its end allocation precedes
 DiT release; `dit_weights_released` records the allocation after release. Measure the
 whole `generate()` call for end-to-end comparisons.
