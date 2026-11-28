@@ -14,6 +14,8 @@ class PipelineTopology:
     stage_layers: tuple[int, ...]
     ingress_replicas: int = 1
     buffer_size: int = field(default=2, kw_only=True)
+    buffer_bytes: int | None = field(default=None, kw_only=True)
+    receive_prefetch: int = field(default=2, kw_only=True)
 
     def __post_init__(self):
         layers = tuple(self.stage_layers)
@@ -22,6 +24,13 @@ class PipelineTopology:
         sizes = (self.ingress_replicas, self.buffer_size)
         if any(type(n) is not int or n < 1 for n in sizes):
             raise ValueError("Replica count and buffer size must be positive")
+        if type(self.receive_prefetch) is not int or self.receive_prefetch < 1:
+            raise ValueError("Receive prefetch must be a positive integer")
+        if self.buffer_bytes is not None:
+            if type(self.buffer_bytes) is not int or self.buffer_bytes < 1:
+                raise ValueError("Buffer byte budget must be positive")
+            if self.ingress_replicas != 1:
+                raise ValueError("Byte buffering currently requires one ingress replica")
         object.__setattr__(self, "stage_layers", layers)
 
     @property

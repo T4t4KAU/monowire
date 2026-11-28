@@ -1,9 +1,12 @@
 """Native H3 request state and stage operations for continuous serving."""
 
+from contextlib import nullcontext
+
 import torch
 
 from ...channels import record_stream
 from ...continuous import PreparedStep
+from ...memory import storage_bytes
 from ...tensor_payload import SharedTensor, TensorParts
 from .io import CodecWorker
 from .packing import pack_requests, validate_block_kwargs
@@ -12,9 +15,82 @@ from .packing import pack_requests, validate_block_kwargs
 class H3RequestAdapter:
     """Own native request state only at ingress; reuse upstream Euler and VAE."""
 
+    memory_pool = None
+
     def __init__(self, pipeline):
         self.pipeline = pipeline
+        self.memory_pool = getattr(pipeline, "monowire_memory_pool", None)
         self.io = CodecWorker(pipeline.device)
+
+    def estimate_request_bytes(self, value):
+        """Conservative token-scaled reservation, including one returned hidden.
+
+        This coefficient is configurable and validated against live request state.
+        It is not a kernel-workspace estimate; that has a separate runtime reserve.
+        """
+        from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+            MINIMAX_H3_SEQ_ALIGN,
+        )
+
+        prompt, sampling = value
+        extra = sampling.extra_args or {}
+        c = self.pipeline._extract_encoder_conditioning(prompt)
+        if c.task not in {"t2va", "fl2va"} or c.guide_blocks or c.video_edit_clean_rows is not None:
+            raise ValueError("Byte admission currently supports plain T2V/first-frame I2V only")
+        if c.audio_edit_clean_rows is not None or extra.get("latent_upscale"):
+            raise ValueError("Byte admission does not yet cover editing/upscaling")
+        if c.task == "fl2va" and len(c.visual_condition_shapes) != 1:
+            raise ValueError("Byte admission currently requires a single image condition")
+        if c.keyframe_frame_indices not in ((), (0,)):
+            raise ValueError("Byte admission currently requires first-frame conditioning")
+        if extra.get("pad_seq_len") is not None:
+            raise ValueError("Byte admission does not yet cover explicit sequence padding")
+        visual = sum(t * (h // 2) * (w // 2) for t, h, w in c.visual_condition_shapes)
+        tokens = (
+            c.hidden_states.shape[0]
+            + visual
+            + 2 * c.audio_t
+            + c.latent_t * (c.height // 32) * (c.width // 32)
+        )
+        tokens = (tokens + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN * MINIMAX_H3_SEQ_ALIGN
+        limits = self.pipeline.monowire_memory_limits
+        return int(tokens * limits.request_bytes_per_token + limits.request_fixed_bytes)
+
+    def _state_size(self, state):
+        from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
+
+        branch = state.extra[native._STEP_BRANCH]
+        return branch, storage_bytes((state.latents, state.timesteps, state.extra, vars(branch)))
+
+    def resident_payload(self, state):
+        branch, _ = self._state_size(state)
+        return state.latents, state.timesteps, state.extra, vars(branch)
+
+    def estimate_step_bytes(self, state):
+        branch, size = self._state_size(state)
+        return int(size + 2 * branch.seq_len * 5376 * 2 + 1024**2)
+
+    def validate_request_reservation(self, state, reserved):
+        branch, size = self._state_size(state)
+        # One result can await commit per active request, even while return I/O
+        # delivers other tickets. Keep this allocation out of the feedback queue's
+        # credit lifetime and inside the request's persistent reservation.
+        required = size + branch.seq_len * 5376 * 2
+        if required > reserved:
+            raise ValueError(
+                f"Request state/return needs {required} bytes; reserved only {reserved}"
+            )
+
+    def validate_inflight_reservation(self, state, prepared, reserved):
+        from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
+
+        branch = state.extra[native._STEP_BRANCH]
+        size = storage_bytes(
+            (state.latents, state.timesteps, state.extra, vars(branch), prepared.payload)
+        )
+        required = size + branch.seq_len * 5376 * 2
+        if required > reserved:
+            raise RuntimeError(f"In-flight context/return needs {required}; reserved {reserved}")
 
     async def admit(self, key, value):
         from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
@@ -110,6 +186,10 @@ class H3RequestAdapter:
         return prepared
 
     def commit(self, state, prepared, output):
+        with self.memory_pool.workspace() if self.memory_pool else nullcontext():
+            return self._commit(state, prepared, output)
+
+    def _commit(self, state, prepared, output):
         from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
 
         payload = prepared.payload
@@ -136,7 +216,10 @@ class H3RequestAdapter:
             )
 
     def prepare_batch(self, prepared):
-        return prepare_transformer_batch([self._prepare_step(item.payload) for item in prepared])
+        with self.memory_pool.workspace() if self.memory_pool else nullcontext():
+            return prepare_transformer_batch(
+                [self._prepare_step(item.payload) for item in prepared]
+            )
 
     def finished(self, state):
         return state.denoise_completed

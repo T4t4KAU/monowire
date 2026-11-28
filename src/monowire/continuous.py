@@ -8,30 +8,72 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .async_utils import await_completion
+from .device_memory import DeviceMemoryLimits
 from .interfaces import BatchExecutor, PipelineFailure, RequestAdapter
+from .memory import MemoryLimits, storage_bytes
 
 
 @dataclass(frozen=True)
 class ContinuousConfig:
-    max_active_requests: int = 32
+    max_active_requests: int | None = 32
     microbatch_size: int = 8
     downstream_batch_size: int = 8
     async_transport: bool = field(default=True, kw_only=True)
     prefix_buffer_batches: int = field(default=2, kw_only=True)
+    memory_limits: MemoryLimits | DeviceMemoryLimits | None = field(default=None, kw_only=True)
+    host_pending_limit: int | None = field(default=128, kw_only=True)
+    queue_policy: str = field(default="auto", kw_only=True)
 
     def __post_init__(self):
+        # Keep the historical count path as the default. Explicit policies
+        # select the existing implementations, without changing transport mode.
+        if self.queue_policy not in ("auto", "count", "bytes", "ring", "pool"):
+            raise ValueError("queue_policy must be auto, count, bytes, ring, or pool")
+        if self.queue_policy in ("ring", "pool") and self.memory_limits is None:
+            object.__setattr__(
+                self,
+                "memory_limits",
+                DeviceMemoryLimits(workspace_bytes=3 * 1024**3, buffer_strategy=self.queue_policy),
+            )
+        if self.queue_policy != "auto" and self.queue_policy != self.resolved_queue_policy:
+            raise ValueError("queue_policy conflicts with memory_limits")
         if type(self.async_transport) is not bool:
             raise ValueError("async_transport must be a boolean")
         sizes = (
-            self.max_active_requests,
             self.microbatch_size,
             self.downstream_batch_size,
             self.prefix_buffer_batches,
         )
         if any(type(size) is not int or size < 1 for size in sizes):
             raise ValueError("Request capacity and batch size must be positive")
-        if self.microbatch_size > self.max_active_requests:
+        if self.host_pending_limit is not None and (
+            type(self.host_pending_limit) is not int or self.host_pending_limit < 1
+        ):
+            raise ValueError("Host pending limit must be positive or None")
+        if self.memory_limits is not None and not isinstance(
+            self.memory_limits, (MemoryLimits, DeviceMemoryLimits)
+        ):
+            raise ValueError("memory_limits must be a MemoryLimits or DeviceMemoryLimits instance")
+        if self.max_active_requests is None:
+            if self.memory_limits is None:
+                raise ValueError("Unlimited active count requires a request byte budget")
+        elif type(self.max_active_requests) is not int or self.max_active_requests < 1:
+            raise ValueError("Active request capacity must be positive or None")
+        if self.max_active_requests is not None and self.microbatch_size > self.max_active_requests:
             raise ValueError("Batch size exceeds active request capacity")
+        if self.memory_limits is not None and (
+            self.microbatch_size != 1 or self.downstream_batch_size != 1
+        ):
+            raise ValueError("Byte residency currently supports BS1 only")
+
+    @property
+    def resolved_queue_policy(self):
+        """Report the effective policy, including legacy memory_limits callers."""
+        if isinstance(self.memory_limits, DeviceMemoryLimits):
+            return self.memory_limits.buffer_strategy
+        if isinstance(self.memory_limits, MemoryLimits):
+            return "bytes"
+        return "count"
 
 
 @dataclass
@@ -41,6 +83,7 @@ class PreparedStep:
     hit: bool
     compatibility: Any
     payload: Any
+    memory_lease: Any = field(default=None, repr=False)
 
 
 @dataclass
@@ -50,6 +93,8 @@ class _Request:
     future: asyncio.Future
     state: Any = None
     inflight: bool = False
+    reserved_bytes: int = 0
+    memory_lease: Any = None
 
 
 class ContinuousScheduler:
@@ -81,6 +126,11 @@ class ContinuousScheduler:
         self.task = None
         self.failure_signal = None
         self._executor_failure = None
+        self.resident_bytes = 0
+        self.peak_resident_bytes = 0
+        self.memory_pool = getattr(adapter, "memory_pool", None)
+        if isinstance(self.config.memory_limits, DeviceMemoryLimits) and self.memory_pool is None:
+            raise ValueError("Dynamic admission requires a shared device memory pool")
 
     def start(self):
         """Monitor the executor while waiting for the first or next arrival."""
@@ -143,7 +193,12 @@ class ContinuousScheduler:
                 self.adapter.release(request.state)
         except Exception as exc:
             error = error or exc
+        if getattr(request, "memory_lease", None) is not None:
+            self.memory_pool.release_after_compute(request.memory_lease)
+            request.memory_lease = None
         self.active.pop(request.key, None)
+        self.resident_bytes -= request.reserved_bytes
+        request.reserved_bytes = 0
         self.ids.discard(request.key)
         if not request.future.done():
             if error is None:
@@ -157,6 +212,11 @@ class ContinuousScheduler:
             self._release(request)
             return
         prepared = self.adapter.prepare(request.state)
+        prepared.memory_lease = getattr(request, "memory_lease", None)
+        if isinstance(self.config.memory_limits, MemoryLimits):
+            estimate = self.adapter.estimate_step_bytes(request.state)
+            if estimate > self.config.memory_limits.buffer_bytes:
+                raise ValueError(f"Step needs {estimate} bytes; exceeds prefix budget")
         if prepared.request_id != request.key:
             raise RuntimeError("Adapter returned the wrong request identity")
         bucket = self.ingress.setdefault(prepared.compatibility, deque())
@@ -164,6 +224,20 @@ class ContinuousScheduler:
         self._event("prefix_ready", request_id=request.key, step=prepared.step)
 
     def _can_prepare(self):
+        limits = self.config.memory_limits
+        if self.memory_pool is not None:
+            # No queue partition: already admitted request state covers preparation.
+            return bool(self.ingress)
+        if limits is not None:
+            ready_bytes = sum(
+                storage_bytes(p.payload) for bucket in self.ready.values() for _, p in bucket
+            )
+            return any(
+                ready_bytes + self.adapter.estimate_step_bytes(bucket[0][0].state)
+                <= limits.buffer_bytes
+                for bucket in self.ingress.values()
+                if bucket
+            )
         queued = sum(len(bucket) for bucket in self.ready.values())
         return queued + self.config.microbatch_size <= (
             self.config.prefix_buffer_batches * self.config.microbatch_size
@@ -175,6 +249,15 @@ class ContinuousScheduler:
             return
         while self.ingress:
             compatibility, bucket = self.ingress.popitem(last=False)
+            if isinstance(self.config.memory_limits, MemoryLimits):
+                ready_bytes = sum(
+                    storage_bytes(p.payload) for group in self.ready.values() for _, p in group
+                )
+                estimate = self.adapter.estimate_step_bytes(bucket[0][0].state)
+                if ready_bytes + estimate > self.config.memory_limits.buffer_bytes:
+                    self.ingress[compatibility] = bucket
+                    # _can_prepare found an admissible bucket; rotate until it.
+                    continue
             members = self._take_batch(bucket)
             if bucket:
                 # Round-robin compatible groups, keeping FIFO order within
@@ -185,15 +268,26 @@ class ContinuousScheduler:
             try:
                 expected = [(request.key, prepared.step) for request, prepared in members]
                 outputs = self.adapter.prepare_batch([prepared for _, prepared in members])
+                if isinstance(self.config.memory_limits, MemoryLimits):
+                    actual = sum(storage_bytes(p.payload) for p in outputs)
+                    if actual > estimate:
+                        raise PipelineFailure(
+                            f"Prefix footprint {actual} exceeds reservation {estimate}"
+                        )
                 if [(prepared.request_id, prepared.step) for prepared in outputs] != expected:
                     raise RuntimeError("Ingress batch changed request identities or order")
                 self._event("prefix_dispatched", requests=expected)
                 for (request, _), prepared in zip(members, outputs, strict=True):
+                    prepared.memory_lease = getattr(request, "memory_lease", None)
+                    if getattr(request, "memory_lease", None) is not None:
+                        request.memory_lease.update(prepared.payload)
                     ready = self.ready.setdefault((prepared.hit, prepared.compatibility), deque())
                     ready.append((request, prepared))
                     self._event(
                         "ready", request_id=request.key, step=prepared.step, hit=prepared.hit
                     )
+            except PipelineFailure:
+                raise
             except Exception as exc:
                 for request, _ in members:
                     self._release(request, exc)
@@ -216,7 +310,47 @@ class ContinuousScheduler:
         task.add_done_callback(self._wake)
 
     def _admit(self):
-        while self.pending and len(self.active) < self.config.max_active_requests:
+        while self.pending and (
+            self.config.max_active_requests is None
+            or len(self.active) < self.config.max_active_requests
+        ):
+            reserved = 0
+            if self.config.memory_limits is not None:
+                key, candidate = next(iter(self.pending.items()))
+                try:
+                    reserved = self.adapter.estimate_request_bytes(candidate.value)
+                    if type(reserved) is not int or reserved < 1:
+                        raise ValueError("Adapter must reserve a positive request byte count")
+                    if (
+                        isinstance(self.config.memory_limits, MemoryLimits)
+                        and reserved > self.config.memory_limits.request_bytes
+                    ):
+                        raise ValueError(f"Request needs {reserved} bytes; exceeds request budget")
+                except Exception as error:
+                    del self.pending[key]
+                    self._release(candidate, error)
+                    continue
+                if self.memory_pool is not None:
+                    try:
+                        candidate.memory_lease = self.memory_pool.try_reserve(reserved)
+                    except ValueError as error:
+                        del self.pending[key]
+                        self._release(candidate, error)
+                        continue
+                    if candidate.memory_lease is None:
+                        self._event(
+                            "memory_backpressure",
+                            requested_bytes=reserved,
+                            **self.memory_pool.snapshot(),
+                        )
+                        break
+                elif self.resident_bytes + reserved > self.config.memory_limits.request_bytes:
+                    self._event(
+                        "memory_backpressure",
+                        requested_bytes=reserved,
+                        resident_bytes=self.resident_bytes,
+                    )
+                    break
             _, request = self.pending.popitem(last=False)
             if request.future.cancelled():
                 self._release(request)
@@ -224,6 +358,9 @@ class ContinuousScheduler:
             # Reserve the slot before asynchronous encoding starts. Admission,
             # denoising and decoding all count toward bounded residency.
             self.active[request.key] = request
+            request.reserved_bytes = reserved
+            self.resident_bytes += reserved
+            self.peak_resident_bytes = max(self.peak_resident_bytes, self.resident_bytes)
             self._start_io(request, "admit", self.adapter.admit(request.key, request.value))
 
     def _complete_io(self):
@@ -233,6 +370,10 @@ class ContinuousScheduler:
                 result = task.result()
                 if phase == "admit":
                     request.state = result
+                    if getattr(request, "memory_lease", None) is not None:
+                        request.memory_lease.update(self.adapter.resident_payload(result))
+                    if self.config.memory_limits is not None:
+                        self.adapter.validate_request_reservation(result, request.reserved_bytes)
                     self._event("admitted", request_id=request.key)
                     self._prepare(request)
                 else:
@@ -249,6 +390,12 @@ class ContinuousScheduler:
                 if not members:
                     continue
                 try:
+                    if (
+                        self.config.memory_limits is not None
+                        and not self.executor.can_submit_prepared([p for _, p in members])
+                    ):
+                        bucket.extendleft(reversed(members))
+                        break
                     outputs = self.executor.submit([prepared for _, prepared in members])
                     if len(outputs) != len(members):
                         raise RuntimeError("Executor future count does not match batch")
@@ -264,6 +411,12 @@ class ContinuousScheduler:
                         request.inflight = True
                         self.tasks[future] = (request, prepared)
                         future.add_done_callback(self._wake)
+                        validate = getattr(self.adapter, "validate_inflight_reservation", None)
+                        if self.config.memory_limits is not None and validate is not None:
+                            try:
+                                validate(request.state, prepared, request.reserved_bytes)
+                            except Exception as error:
+                                raise PipelineFailure(str(error)) from error
                     self._event(
                         "dispatched",
                         requests=[(prepared.request_id, prepared.step) for _, prepared in members],
@@ -284,6 +437,10 @@ class ContinuousScheduler:
                     self._release(request)
                     continue
                 self.adapter.commit(request.state, prepared, output)
+                if getattr(request, "memory_lease", None) is not None:
+                    request.memory_lease.update(self.adapter.resident_payload(request.state))
+                if self.config.memory_limits is not None:
+                    self.adapter.validate_request_reservation(request.state, request.reserved_bytes)
                 self._event("step_completed", request_id=request.key, step=prepared.step)
                 if self.adapter.finished(request.state):
                     self._start_io(request, "finish", self.adapter.finish(request.state))
@@ -296,6 +453,14 @@ class ContinuousScheduler:
 
     def _has_work(self):
         return bool(self.pending or self.active or self.tasks or self.io_tasks)
+
+    def _can_dispatch(self):
+        if self.config.memory_limits is None:
+            return bool(self.ready) and self.executor.can_submit
+        return any(
+            bucket and self.executor.can_submit_prepared([bucket[0][1]])
+            for bucket in self.ready.values()
+        )
 
     async def _run(self):
         try:
@@ -313,12 +478,19 @@ class ContinuousScheduler:
                     break
                 if (
                     (self.ingress and self._can_prepare())
-                    or (self.ready and self.executor.can_submit)
+                    or self._can_dispatch()
                     or any(task.done() for task in (*self.tasks, *self.io_tasks))
                 ):
                     await asyncio.sleep(0)
                 else:
-                    await self.wakeup.wait()
+                    if self.memory_pool is None:
+                        await self.wakeup.wait()
+                    else:
+                        # CUDA completion/external releases need not emit a scheduler event.
+                        try:
+                            await asyncio.wait_for(self.wakeup.wait(), 0.01)
+                        except TimeoutError:
+                            pass
         except BaseException as error:
             await self._drain_failed(error)
             raise

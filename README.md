@@ -92,6 +92,59 @@ For first-and-last-frame conditioning in Python, pass
 Use the matching partition for each job; FL2VA and Ref2VA weights are never
 co-resident. Run `monowire --help` for all options.
 
+### Experimental byte-based DiT residency
+
+The Python API can replace GPU task-count limits with byte reservations for
+BS1, one ingress, cache-free T2VA and first-frame FL2VA. Use phased execution or
+pre-encoded conditions; encoder/DiT loading overlap is not supported in this mode.
+
+```python
+from monowire import ContinuousConfig, MemoryLimits
+
+MiB, GiB = 1024**2, 1024**3
+config = ContinuousConfig(
+    max_active_requests=None,
+    microbatch_size=1,
+    downstream_batch_size=1,
+    host_pending_limit=None,  # Finite job already fits CPU RAM; no intake count cap.
+    memory_limits=MemoryLimits(
+        request_bytes=4 * GiB,
+        pipeline_bytes=9 * 640 * MiB,
+        workspace_bytes=3 * GiB,
+    ),
+)
+# Pass config to create_phased_engine(..., config=config).
+```
+
+These values are trial settings, not a validated 4090 performance recommendation.
+Admission reserves request state and one returned hidden tensor using encoded
+token length. Live state and in-flight context are checked against that estimate;
+`request_bytes_per_token` is a configurable conservative coefficient. It is not a
+measurement of kernel scratch memory. Oversize requests receive an error instead
+of waiting forever. `host_pending_limit` still bounds submitted/unconsumed CPU
+requests when set (default128), independently of GPU admission. Set it to `None`
+for a finite job whose CPU residency is already accounted for; otherwise this
+host backpressure can indirectly limit the number of GPU-active requests too.
+
+The pipeline budget is divided into nine equal domains: two channel in-flight
+windows, receive queue, computation window, send queue, prefix lookahead, and
+three handoff reserves. This preserves space for computation and return progress
+when input queues fill. Queue counts vary with payload size; `buffer_size` and
+`prefix_buffer_batches` no longer govern these GPU buffers in byte mode.
+Storage views are deduplicated within a payload; different domains conservatively
+charge overlapping ownership separately. This is not yet a freely shared,
+globally deduplicated memory pool.
+
+In-flight CUDA buffers remain charged until their completion event. Removing a
+message from a receive/send queue does not immediately return its bytes: receive
+credit is held through consumption, and send credit through handoff to the
+channel's separately bounded in-flight window. Shared dictionaries have a
+separate fixed byte cap. After weights load, all ranks check that the configured
+dynamic reservations plus workspace and allocator/library headroom fit before
+creating pipeline channels. Workspace must be sized from profiling; this policy
+does not predict arbitrary kernel allocation peaks or cover VAE/encoder phases.
+The default configuration retains the existing count-based behavior.
+
 ### Finite jobs with separate model phases
 
 `--phased` runs the entire finite job as Qwen-VL layer PP → VAE encoding →
@@ -200,3 +253,120 @@ or a profiler for that. In overlap mode,
 the `dit` phase excludes CPU preload/GPU copying and its end allocation precedes
 DiT release; `dit_weights_released` records the allocation after release. Measure the
 whole `generate()` call for end-to-end comparisons.
+
+
+### Configurable queue policies
+
+Count, ring, and pool are parallel configuration options for asynchronous queues.
+Count remains the default for compatibility and serves as a performance control.
+Select a policy when constructing a new engine:
+
+```python
+from monowire import ContinuousConfig
+
+config = ContinuousConfig(
+    max_active_requests=32,
+    microbatch_size=1,
+    downstream_batch_size=1,
+    queue_policy="count",  # "count", "ring", or "pool"
+)
+```
+
+- `count`: original bounded queues controlled by `PipelineTopology.buffer_size`
+  (default 2), with normal tensor allocation and no new admission handshake,
+  reusable receive arena, or feedback clone. Keep `memory_limits=None`.
+- `ring` / `pool`: experimental byte-capacity receive buffers described below.
+  Without explicit `memory_limits`, these create `DeviceMemoryLimits` with a
+  3 GiB workspace margin and its other defaults. Supply matching
+  `DeviceMemoryLimits(..., buffer_strategy="ring" or "pool")` to customize them.
+
+All three keep asynchronous transport and Active as separate settings. Policy
+changes require draining and recreating the engine; live buffer ownership cannot
+be switched in place. Conflicting policy and memory-limit settings raise an error.
+The default `queue_policy="auto"` preserves existing callers: no limits selects
+`count`, `DeviceMemoryLimits` selects its buffer strategy, and `MemoryLimits`
+selects the older `bytes` policy. `config.resolved_queue_policy` reports the actual
+selection. Paired 8-GPU RTX 4090 tests with 8 requests and 2 denoising steps
+(384p, 243-frame first-frame I2V, BS1) produced identical output hashes and
+completed in 46.12 s for count, 46.29 s for pool, and 46.26 s for ring. This
+validates the short-run regression fix, not sustained-throughput acceptance.
+Longer paired measurements remain pending; separate initial pipeline propagation,
+sustained throughput, and drain time when comparing policies.
+
+For ring/pool, `PipelineTopology(..., receive_prefetch=2)` independently bounds
+suffix receive lookahead per upstream peer. A credit covers a posted receive
+until the compute owner consumes its packet (all items for a split packet).
+This also bounds unconsumed received packets; it is not a total resident-task
+limit. Consuming a packet returns the prefetch credit while its storage remains
+charged until the final GPU consumer completes. Active and ring/pool byte
+capacities are unchanged. Count continues to use `buffer_size`; the older
+`bytes` policy retains its existing behavior. The default prefetch depth of 2
+addresses the measured cold-start regression from deep queued NCCL receives;
+it is configurable, not a claim of optimal depth for every workload.
+
+Receive storage is allocated on the receiving CUDA stream before its first
+write. Slot recycling still waits for the final GPU consumer, including when
+packing, computation, or result handling aborts. Failed admission acknowledgements
+release slots that have not entered tensor transfer. Send failure and queue
+publication are serialized so a failed sender cannot accept orphaned work.
+
+### Shared dynamic GPU admission (experimental)
+
+Use `DeviceMemoryLimits` to keep `Active` independent of GPU queue capacity:
+
+```python
+from monowire import ContinuousConfig, DeviceMemoryLimits
+
+config = ContinuousConfig(
+    max_active_requests=32,
+    microbatch_size=1,
+    downstream_batch_size=1,
+    memory_limits=DeviceMemoryLimits(workspace_bytes=3 * 1024**3),
+)
+```
+
+Each GPU has one CPU-side ledger initialized after weights and any known external
+allocations. Admission updates CPU counters; it does not query the driver or scan
+live tensor storage. Request reservations cover their whole lifetime. One compute
+stream shares one workspace margin. Active remains an independent upper bound.
+
+Select either `DeviceMemoryLimits(..., buffer_strategy="ring")` (default) or
+`buffer_strategy="pool"`. Both use the same byte-budget interface:
+
+- `ring`: one contiguous variable-length receive arena; tensors never straddle
+  its end. Reclamation follows FIFO completion, with wrap padding recorded.
+- `pool`: power-of-two size-class receive buffers, independently reclaimed;
+  idle incompatible classes can be replaced within the same byte capacity.
+
+`buffer_bytes=None` derives ordinary receive capacity from the remaining ledger;
+set a positive byte count to cap it for experiments. A receive arena reserves
+three times its capacity: storage plus two retained packing/output copies. This
+is a conservative H3 BS1 bound, not a general allocator guarantee. There is no
+fixed task-count limit on receive occupancy. Both strategies retain ownership
+through the final send event, not just dequeue or compute submission. Shared
+condition declarations use separate dictionary storage and never alias recyclable
+receive slots.
+
+Half of `progress_bytes` is reserved exclusively for feedback staging; the other
+half protects non-contiguous outgoing copies. These are independent cumulative
+ledger budgets (`feedback` and `wire`), established before the first packet.
+Multiple in-flight copies cannot borrow feedback capacity. Feedback is copied on the GPU into
+request-owned storage before recycling its receive buffer. This additional copy
+is explicit and must be included in performance comparisons. The wire keeps its
+existing metadata/approval handshake; this change does not claim to implement
+batched credit announcements or eliminate every CPU round trip.
+
+This mode currently supports BS1, one ingress, pre-encoded/phased T2V and first-frame
+I2V, with feature caching disabled. Workspace/progress/headroom must be measured
+for each model and length range. Capacity is fixed for the runtime lifetime:
+external allocations must precede runtime construction or be explicitly charged;
+untracked external allocations are not automatically detected by hot admission.
+`MemoryLimits` remains available for older fixed-partition experiments.
+`runtime.memory_pool.snapshot()` reports buffer reuse, occupancy, wait time,
+ring wrap padding and head-of-line waits, and pool size-class rounding. Persistent
+pool leases remain until channel shutdown; live consumers must be zero after drain.
+Ring slot starts also satisfy each packet's dtype alignment when a smaller
+`buffer_alignment` is configured. Failed view construction releases the acquired
+slot. During shutdown, queued packets retire while receivers drain, including
+racing arrivals; storage still waits for its CUDA last-use event before reuse.
+Waiting for completion does not hold the shared capacity ledger lock.

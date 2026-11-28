@@ -2,14 +2,16 @@
 
 import os
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import torch
+import torch.distributed as dist
 
 from ...cache import CacheConfig
 from ...channels import close_channels, create_channels
 from ...continuous import ContinuousConfig
 from ...continuous_engine import ContinuousEngine
+from ...device_memory import DeviceMemoryLimits, DeviceMemoryPool
 from ...transport import PipelineExecutor, serve_stage
 from .adapter import H3RequestAdapter, H3StageAdapter
 from .validation import validate_runtime
@@ -21,22 +23,76 @@ class H3Runtime:
         self.config = config
         self.pipeline = worker.model_runner.pipeline
         self.stage = H3StageAdapter(self.pipeline.transformer)
+        limits = config.memory_limits
         adaln_cache = self.stage.transformer.adaln_cache
-        if adaln_cache is not None and adaln_cache.sidecar is not None:
+        invalid_adaln = adaln_cache is not None and adaln_cache.sidecar is not None
+        if invalid_adaln and limits is None:
             raise ValueError("Continuous H3 requires the request-independent AdaLN runtime cache")
         # Place DiT once at startup; codecs cannot evict or move these weights.
         self.stage.transformer.to(self.pipeline.device)
         self.rank = self.stage.group.rank_in_group
         self.topology = self.stage.transformer.topology
+        self.memory_pool = None
+        if limits is not None:
+            local_errors = []
+            if invalid_adaln:
+                local_errors.append(
+                    "Continuous H3 requires the request-independent AdaLN runtime cache"
+                )
+            if self.topology.ingress_replicas != 1:
+                local_errors.append("Byte residency currently requires one ingress")
+            if self.pipeline.load_text_encoder or self.pipeline.load_vae_encoder:
+                local_errors.append("Byte residency requires phased/pre-encoded DiT inputs")
+            if self.stage.transformer.request_cache.config.policy != "none":
+                local_errors.append("Byte residency currently requires cache policy none")
+            if torch.device(self.pipeline.device).type == "cuda":
+                free, total = torch.cuda.mem_get_info(self.pipeline.device)
+                reclaimable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                required = (
+                    limits.workspace_bytes + limits.headroom_bytes + limits.progress_bytes
+                    if isinstance(limits, DeviceMemoryLimits)
+                    else limits.dynamic_bytes - (limits.request_bytes if self.rank else 0)
+                )
+                if required > free + reclaimable:
+                    local_errors.append(
+                        f"Byte policy requires {required} free bytes including workspace/headroom; "
+                        f"only {free + reclaimable} available on rank {self.rank}"
+                    )
+            errors = [None] * self.topology.world_size
+            error = "; ".join(local_errors) or None
+            dist.all_gather_object(errors, error, group=self.stage.group.cpu_group)
+            if any(errors):
+                raise ValueError("; ".join(e for e in errors if e))
+            if isinstance(limits, DeviceMemoryLimits):
+                try:
+                    self.memory_pool = DeviceMemoryPool(self.pipeline.device, limits)
+                    error = None
+                except Exception as exc:
+                    error = str(exc)
+                dist.all_gather_object(errors, error, group=self.stage.group.cpu_group)
+                if any(errors):
+                    raise ValueError("; ".join(e for e in errors if e))
+                self.pipeline.monowire_memory_pool = self.memory_pool
+                self.topology = replace(self.topology, buffer_bytes=None)
+            else:
+                self.topology = replace(self.topology, buffer_bytes=limits.buffer_bytes)
+            self.stage.transformer.topology = self.topology
+            self.pipeline.monowire_memory_limits = limits
         self.ingress_replicas = self.topology.ingress_replicas
         self.channels = (
             channels
             if channels is not None
             else create_channels(
-                self.topology, self.pipeline.device, async_transport=config.async_transport
+                self.topology,
+                self.pipeline.device,
+                async_transport=config.async_transport,
+                memory_pool=self.memory_pool,
             )
         )
         self.on_stage_event = None
+        if limits is not None:
+            for channel in self.channels.values():
+                channel.dictionary.max_bytes = limits.dictionary_bytes
 
     @contextmanager
     def context(self):
@@ -74,6 +130,8 @@ class H3Runtime:
             if self.channels is not None:
                 close_channels(self.channels)
         finally:
+            if self.memory_pool is not None:
+                self.memory_pool.drain()
             self.channels = None
             if shutdown_worker:
                 self.worker.shutdown()
@@ -115,7 +173,7 @@ def create_continuous_engine(
         enforce_eager=True,
         cache_backend="none",
         step_execution=True,
-        max_num_seqs=config.max_active_requests,
+        max_num_seqs=config.max_active_requests or 1,
         enable_cpu_offload=cpu_offload,
         model_loaded={
             "text_encoder": is_ingress,

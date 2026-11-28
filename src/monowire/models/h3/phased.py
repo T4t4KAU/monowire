@@ -44,6 +44,8 @@ class PhasedH3Engine:
     ):
         self.additional_config = dict(additional_config or {})
         self.overlap_encoder_dit = overlap_encoder_dit
+        if getattr(config, "memory_limits", None) is not None and overlap_encoder_dit:
+            raise ValueError("Byte residency currently requires non-overlapped phase loading")
         self.timeline_events = []
         self.model = str(model)
         self.pp_size = pp_size
@@ -142,7 +144,7 @@ class PhasedH3Engine:
             cache_backend="none",
             step_execution=True,
             additional_config=self.additional_config,
-            max_num_seqs=self.config.max_active_requests,
+            max_num_seqs=self.config.max_active_requests or 1,
             enable_cpu_offload=False,
             model_loaded={"text_encoder": False, "vae_encoder": False, "vae_decoder": False},
             cache_config={
@@ -172,6 +174,11 @@ class PhasedH3Engine:
         )
 
         extra = sampling.extra_args or {}
+        if (
+            getattr(getattr(self, "config", None), "memory_limits", None) is not None
+            and self._request_mode(sampling)
+        ):
+            raise ValueError("Byte residency does not yet cover native multi-pass request mode")
         if sampling.lora_request is not None or extra.get("sampler", "euler") != "euler":
             raise ValueError("Phased H3 requires original weights and Euler sampling")
         if getattr(sampling, "quality", None) == "high":

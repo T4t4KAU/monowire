@@ -2,6 +2,7 @@
 
 import gc
 import tempfile
+import threading
 import unittest
 import weakref
 from pathlib import Path
@@ -47,6 +48,79 @@ def p2p_operation(operation, tensor, peer, group):
 
 
 class InFlightTests(unittest.TestCase):
+    def test_sender_failure_cannot_leave_late_publication_without_consumer(self):
+        for dynamic in (False, True):
+            with self.subTest(dynamic=dynamic):
+                fail, failed, checked, resume = (threading.Event() for _ in range(4))
+
+                class Channel:
+                    memory_pool = object() if dynamic else None
+
+                    def send(self, *args):
+                        if not fail.wait(2):
+                            raise TimeoutError("test failed to release sender")
+                        raise OSError("send failed")
+
+                sender = BufferedSender(Channel(), 2, on_error=lambda _: failed.set())
+                sender.submit({"first": True})
+                check = sender.check
+
+                def paused_check():
+                    check()
+                    checked.set()
+                    if not resume.wait(2):
+                        raise TimeoutError("test failed to release publisher")
+
+                errors = []
+
+                def publish():
+                    try:
+                        sender.submit_nowait({"late": True})
+                    except RuntimeError as error:
+                        errors.append(error)
+
+                with patch.object(sender, "check", paused_check):
+                    producer = threading.Thread(target=publish)
+                    producer.start()
+                    try:
+                        self.assertTrue(checked.wait(1))
+                        fail.set()
+                        # Old code finishes its final drain here, then accepts
+                        # the paused publisher. Atomic publication prevents it.
+                        failed.wait(0.1)
+                    finally:
+                        resume.set()
+                    producer.join(2)
+                    sender.thread.join(2)
+                self.assertFalse(producer.is_alive())
+                self.assertFalse(sender.thread.is_alive())
+                self.assertIsInstance(sender.error, OSError)
+                self.assertTrue(sender.queue.empty())
+
+    def test_count_channel_does_not_enter_buffer_admission_protocol(self):
+        channel = TensorChannel(0, 1, "gloo", None, "cpu", capacity=2)
+        spec = _encode({"hidden": torch.ones(2)}, [])
+
+        def metadata(values, **kwargs):
+            values[0] = spec
+
+        with (
+            patch("monowire.channels.dist.send_object_list") as send_metadata,
+            patch("monowire.channels.dist.recv_object_list", side_effect=metadata) as recv_metadata,
+            patch.object(channel, "_transfer"),
+            patch("monowire.channels.ReceiveBuffers") as buffers,
+        ):
+            channel.send({"hidden": torch.ones(2)})
+            self.assertEqual(send_metadata.call_count, 1)
+            recv_metadata.assert_not_called()  # No downstream approval round trip.
+            received = channel.recv()
+            self.assertEqual(recv_metadata.call_count, 1)
+            self.assertEqual(send_metadata.call_count, 1)  # No approval response.
+            buffers.assert_not_called()
+        self.assertEqual(received.value["hidden"].shape, (2,))
+        self.assertIsNone(channel.memory_pool)
+        self.assertIsNone(channel.receive_buffers)
+
     def test_async_transport_is_default_and_can_be_disabled(self):
         from monowire.continuous import ContinuousConfig
 

@@ -5,11 +5,50 @@ from unittest.mock import patch
 
 from monowire.cli import main
 from monowire.continuous import ContinuousConfig
+from monowire.device_memory import DeviceMemoryLimits
 from monowire.models.h3.runtime import H3Runtime
 from monowire.topology import PipelineTopology
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_receive_prefetch_is_independent_of_storage_count(self):
+        topology = PipelineTopology((6, 44), buffer_size=9)
+        self.assertEqual(topology.receive_prefetch, 2)
+        self.assertEqual(PipelineTopology((6, 44), receive_prefetch=4).receive_prefetch, 4)
+        for value in (0, -1, 1.5, True, None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "prefetch"):
+                PipelineTopology((6, 44), receive_prefetch=value)
+
+    def test_count_remains_default_and_explicit_option(self):
+        for config in (ContinuousConfig(), ContinuousConfig(queue_policy="count")):
+            self.assertEqual(config.resolved_queue_policy, "count")
+            self.assertIsNone(config.memory_limits)
+            self.assertTrue(config.async_transport)
+            self.assertEqual(config.max_active_requests, 32)
+
+    def test_explicit_buffer_policies_and_legacy_selection(self):
+        for policy in ("ring", "pool"):
+            config = ContinuousConfig(32, 1, 1, queue_policy=policy)
+            self.assertEqual(config.resolved_queue_policy, policy)
+            self.assertEqual(config.memory_limits.buffer_strategy, policy)
+            self.assertEqual(config.max_active_requests, 32)
+            limits = DeviceMemoryLimits(123, buffer_strategy=policy)
+            for kwargs in ({}, {"queue_policy": policy}):
+                custom = ContinuousConfig(32, 1, 1, memory_limits=limits, **kwargs)
+                self.assertIs(custom.memory_limits, limits)
+                self.assertEqual(custom.resolved_queue_policy, policy)
+
+    def test_policy_conflicts_are_not_silently_ignored(self):
+        for policy in ("count", "pool", "bytes"):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "conflicts"):
+                ContinuousConfig(
+                    32, 1, 1, queue_policy=policy, memory_limits=DeviceMemoryLimits(123)
+                )
+        with self.assertRaisesRegex(ValueError, "queue_policy"):
+            ContinuousConfig(queue_policy="unknown")
+        with self.assertRaisesRegex(ValueError, "Unlimited active"):
+            ContinuousConfig(None, 1, 1, queue_policy="count")
+
     def test_cli_keeps_distinct_ingress_and_suffix_limits_for_both_layouts(self):
         arguments = [
             "monowire",

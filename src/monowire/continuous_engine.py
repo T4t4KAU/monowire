@@ -93,7 +93,12 @@ class ContinuousEngine:
         completed = asyncio.Queue()
         # Count submitted requests until their results are consumed, including
         # completed outputs. A slow consumer must also backpressure the source.
-        slots = asyncio.Semaphore(2 * self.config.max_active_requests)
+        host_limit = (
+            self.config.host_pending_limit
+            if self.config.memory_limits is not None
+            else 2 * self.config.max_active_requests
+        )
+        slots = asyncio.Semaphore(host_limit) if host_limit is not None else None
         futures = set()
         accepting = True
 
@@ -108,11 +113,13 @@ class ContinuousEngine:
             nonlocal accepting
             try:
                 async for request_id, prompt, sampling in source:
-                    await slots.acquire()
+                    if slots is not None:
+                        await slots.acquire()
                     try:
                         future = scheduler.submit(request_id, (prompt, sampling))
                     except BaseException:
-                        slots.release()
+                        if slots is not None:
+                            slots.release()
                         raise
                     futures.add(future)
                     future.add_done_callback(
@@ -140,7 +147,8 @@ class ContinuousEngine:
             while (item := await completed.get()) is not None:
                 request_id, future = item
                 futures.discard(future)
-                slots.release()
+                if slots is not None:
+                    slots.release()
                 if future.cancelled():
                     yield ContinuousOutput(request_id, error="Request cancelled")
                 elif (error := future.exception()) is not None:
