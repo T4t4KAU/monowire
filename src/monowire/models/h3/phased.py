@@ -15,7 +15,8 @@ import torch.distributed as dist
 from ...cache import CacheConfig
 from ...continuous import ContinuousConfig
 from ...continuous_engine import ContinuousEngine
-from .phase_utils import cpu_tree, encoder_partition
+from .phase_parallel import PhaseParallelConfig
+from .phase_utils import cpu_tree
 from .runtime import H3Runtime
 from .validation import validate_runtime
 
@@ -26,7 +27,8 @@ class PhasedH3Engine:
     """All ranks call generate with a common finite job; only rank 0 returns outputs.
 
     Phase tensors live in CPU RAM. No model weights survive a phase boundary.
-    Optional rolling handoff overlaps local DiT loading with Qwen drain.
+    Optional rolling handoff requires multi-stage Qwen PP and overlaps local
+    DiT loading with Qwen drain.
     """
 
     def __init__(
@@ -40,17 +42,30 @@ class PhasedH3Engine:
         encoder_stage_layers,
         trust_remote_code,
         overlap_encoder_dit=False,
+        overlap_dit_decoder=False,
         additional_config=None,
+        phase_parallel=None,
     ):
         self.additional_config = dict(additional_config or {})
+        self.phase_parallel = PhaseParallelConfig.resolve(
+            pp_size, phase_parallel, encoder_stage_layers=encoder_stage_layers, topology=topology
+        )
+        if overlap_encoder_dit:
+            self.phase_parallel.validate_overlap()
+        if topology is None and self.phase_parallel.denoiser.stage_layers is not None:
+            from ...topology import PipelineTopology
+
+            topology = PipelineTopology(self.phase_parallel.denoiser.stage_layers)
         self.overlap_encoder_dit = overlap_encoder_dit
+        self.overlap_dit_decoder = overlap_dit_decoder
         if getattr(config, "memory_limits", None) is not None and overlap_encoder_dit:
             raise ValueError("Byte residency currently requires non-overlapped phase loading")
         self.timeline_events = []
         self.model = str(model)
         self.pp_size = pp_size
         self.config, self.cache, self.topology = config, cache, topology
-        self.encoder_stage_layers = encoder_partition(pp_size, encoder_stage_layers)
+        self.encoder_stage_layers = self.phase_parallel.encoder.stage_layers or (50,)
+        self._encoder_groups = []
         self.trust_remote_code = trust_remote_code
         self.rank = int(os.environ.get("RANK", "0"))
         self.ingress_replicas = 1
@@ -163,6 +178,16 @@ class PhasedH3Engine:
 
         world = get_world_group()
         self.cpu_group, self.device_group = world.cpu_group, world.device_group
+        self.encoder_cpu_group, self.encoder_device_group = self.cpu_group, self.device_group
+        encoder = self.phase_parallel.encoder
+        if encoder.mode != "pp" or encoder.ranks != tuple(range(self.pp_size)):
+            members = [encoder.ranks] if encoder.mode != "dp" else [(r,) for r in encoder.ranks]
+            for ranks in members:
+                cpu = dist.new_group(ranks=list(ranks), backend="gloo")
+                device = dist.new_group(ranks=list(ranks), backend="nccl")
+                if self.rank in ranks:
+                    self.encoder_cpu_group, self.encoder_device_group = cpu, device
+                    self._encoder_groups.extend((device, cpu))
 
     def _prepare(self, prompts, sampling):
         from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
@@ -174,10 +199,13 @@ class PhasedH3Engine:
         )
 
         extra = sampling.extra_args or {}
-        if (
-            getattr(getattr(self, "config", None), "memory_limits", None) is not None
-            and self._request_mode(sampling)
-        ):
+        if getattr(self, "overlap_dit_decoder", False) and self._request_mode(sampling):
+            raise ValueError(
+                "Rolling DiT/decoder handoff does not yet support multi-pass request mode"
+            )
+        if getattr(
+            getattr(self, "config", None), "memory_limits", None
+        ) is not None and self._request_mode(sampling):
             raise ValueError("Byte residency does not yet cover native multi-pass request mode")
         if sampling.lora_request is not None or extra.get("sampler", "euler") != "euler":
             raise ValueError("Phased H3 requires original weights and Euler sampling")
@@ -279,14 +307,81 @@ class PhasedH3Engine:
             or extra.get("long_video_mode") == "continuation"
         )
 
+    def _map_codec(self, name, items, operation):
+        stage = getattr(self.phase_parallel, name)
+        if stage.mode == "single" and stage.ranks == (0,):
+            return self._leader(lambda: operation(items))
+        from .phase_dispatch import map_phase
+
+        return map_phase(items, operation, stage.ranks, self.cpu_group)
+
+    def _media_phase(self, prepared, hidden=None, tags=None):
+        if self.phase_parallel.media_encoder.ranks == (0,):
+            return (
+                self._leader(lambda: self._encode_media(prepared, hidden, tags))
+                if hidden is not None
+                else self._leader(lambda: self._encode_media(prepared))
+            )
+        media = self._map_codec("media_encoder", prepared, self._encode_media)
+        return self._leader(
+            lambda: (
+                media
+                if hidden is None
+                else [self._conditioning_payload(h, t, m) for h, t, m in zip(hidden, tags, media)]
+            )
+        )
+
+    def _decode_phase(self, outputs, sampling):
+        return self._map_codec("decoder", outputs, lambda items: self._decode(items, sampling))
+
     def _encode_text(self, inputs, lengths, *, on_output=None, on_ready=None):
+        encoder = self.phase_parallel.encoder
+        if encoder.mode == "pp" and encoder.ranks == tuple(range(self.pp_size)):
+            return self._encode_text_local(inputs, lengths, on_output=on_output, on_ready=on_ready)
+        if on_output is not None or on_ready is not None:
+            raise ValueError("Rolling handoff requires matching encoder and DiT rank sets")
+        if encoder.mode in {"single", "dp"}:
+            from .phase_dispatch import map_phase
+
+            return map_phase(
+                inputs,
+                lambda rows: self._encode_text_local(rows, [len(ids) for ids, _ in rows]),
+                encoder.ranks,
+                self.cpu_group,
+            )
+        # A PP subgroup consumes the whole ordered input stream, with its own
+        # local rank numbering. Only its first rank needs preprocessing inputs.
+        shards = [None] * self.pp_size if self.is_ingress else None
+        if shards is not None:
+            shards[encoder.ranks[0]] = cpu_tree(inputs)
+        incoming = [None]
+        dist.scatter_object_list(incoming, shards, src=0, group=self.cpu_group)
+        from .phase_completion import complete_phase
+
+        hidden = complete_phase(
+            lambda: (
+                self._encode_text_local(incoming[0], lengths)
+                if self.rank in encoder.ranks
+                else None
+            ),
+            name="Encoder",
+        )
+        result = [None] * self.pp_size if self.is_ingress else None
+        dist.gather_object(
+            hidden if self.rank == encoder.ranks[0] else None,
+            result,
+            dst=0,
+            group=self.cpu_group,
+        )
+        return result[encoder.ranks[0]] if self.is_ingress else None
+
+    def _encode_text_local(self, inputs, lengths, *, on_output=None, on_ready=None):
         from transformers import Qwen3VLConfig
 
         from .encoder_pp import QwenPPEncoder, run_encoder_pipeline
 
         path = Path(self.model) / "text_encoder"
-        config = Qwen3VLConfig.from_pretrained(str(path), local_files_only=True)
-        stage = QwenPPEncoder(config, self.encoder_stage_layers, self.rank, self.worker.device)
+        stage = None
 
         def ready():
             if on_ready is not None:
@@ -294,13 +389,28 @@ class PhasedH3Engine:
             self._mark("qwen_compute_start")
 
         try:
-            stage.load_checkpoint(path)
+            error = None
+            try:
+                config = Qwen3VLConfig.from_pretrained(str(path), local_files_only=True)
+                stage = QwenPPEncoder(
+                    config,
+                    self.encoder_stage_layers,
+                    dist.get_rank(self.encoder_device_group),
+                    self.worker.device,
+                )
+                stage.load_checkpoint(path)
+            except Exception as exc:
+                error = f"rank {self.rank}: {type(exc).__name__}: {exc}"
+            errors = [None] * dist.get_world_size(self.encoder_cpu_group)
+            dist.all_gather_object(errors, error, group=self.encoder_cpu_group)
+            if any(errors):
+                raise RuntimeError("Qwen load failed: " + "; ".join(e for e in errors if e))
             return run_encoder_pipeline(
                 stage,
                 inputs,
                 lengths,
-                self.device_group,
-                self.cpu_group,
+                self.encoder_device_group,
+                self.encoder_cpu_group,
                 on_output=on_output,
                 on_ready=ready,
             )
@@ -378,7 +488,7 @@ class PhasedH3Engine:
             "additional_information": {"encoder_output": cpu_tree(conditioning.to_omni_payload())}
         }
 
-    def _denoise(self, encoded, sampling):
+    def _denoise(self, encoded, sampling, *, on_output=None):
         from vllm.config import LoadConfig
         from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 
@@ -389,16 +499,32 @@ class PhasedH3Engine:
                 load_device="cpu", device=self.worker.device
             )
             runtime = H3Runtime(self.worker, self.config)
-            engine = ContinuousEngine(runtime, self.config)
-            return engine.generate(encoded or [], sampling)
-        finally:
-            if runtime is not None:
-                runtime.close(shutdown_worker=False)
-            # Keep distributed groups alive for the next phase, drop all DiT owners.
-            self.worker.model_runner.pipeline = None
-            del engine, runtime, loader
+            engine = ContinuousEngine(
+                runtime, self.config, retire_on_final_dispatch=on_output is not None
+            )
+            if on_output is None:
+                return engine.generate(encoded or [], sampling)
 
-    def _generate_overlap(self, prepared, inputs, tags, lengths, sampling):
+            async def source():
+                for index, prompt in enumerate(encoded or []):
+                    yield str(index), prompt, sampling
+
+            async def collect():
+                async for output in engine.stream(source()):
+                    on_output(output)
+                return []
+
+            return asyncio.run(collect())
+        finally:
+            try:
+                if runtime is not None:
+                    runtime.close(shutdown_worker=False)
+            finally:
+                # Keep world groups, but release every local DiT owner before VAE load.
+                self.worker.model_runner.pipeline = None
+                engine = runtime = loader = None
+
+    def _generate_overlap(self, prepared, inputs, tags, lengths, sampling, *, on_output=None):
         from vllm.config import LoadConfig
         from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 
@@ -406,9 +532,7 @@ class PhasedH3Engine:
         from .rolling import EncoderInbox
 
         # FL2VA image conditions must exist before Qwen drain starts.
-        media = self._phase(
-            "vae_encode", lambda: self._leader(lambda: self._encode_media(prepared))
-        )
+        media = self._phase("vae_encode", lambda: self._media_phase(prepared))
         # These private job lists are also referenced by generate(). Clear their
         # contents at the last consumer instead of retaining images/pixels while
         # the full DiT checkpoint and conditioning tensors occupy host memory.
@@ -465,7 +589,9 @@ class PhasedH3Engine:
             torch.cuda.synchronize(self.worker.device)
             self._mark("dit_gpu_ready")
             runtime.on_stage_event = self._dit_event
-            engine = ContinuousEngine(runtime, self.config)
+            engine = ContinuousEngine(
+                runtime, self.config, retire_on_final_dispatch=on_output is not None
+            )
             engine.on_event = self._dit_event
 
             async def requests():
@@ -478,11 +604,23 @@ class PhasedH3Engine:
                     yield str(index), payload, sampling
 
             async def collect():
-                return [output async for output in engine.stream(requests())]
+                outputs = []
+                async for output in engine.stream(requests()):
+                    if on_output is None:
+                        outputs.append(output)
+                    else:
+                        on_output(output)
+                return outputs
 
             # No collective between local encoder release and DiT serving.
             outputs = self._phase(
-                "dit", lambda: self._finish_dit(lambda: asyncio.run(collect())), barrier=False
+                "dit",
+                lambda: (
+                    asyncio.run(collect())
+                    if on_output is not None
+                    else self._finish_dit(lambda: asyncio.run(collect()))
+                ),
+                barrier=False,
             )
         finally:
             try:
@@ -504,10 +642,9 @@ class PhasedH3Engine:
                         gc.collect()
                         torch.cuda.empty_cache()
         self._mark("dit_weights_released", allocated_bytes=torch.cuda.memory_allocated())
-        return (
-            self._phase("vae_decode", lambda: self._leader(lambda: self._decode(outputs, sampling)))
-            or []
-        )
+        if on_output is not None:
+            return outputs
+        return self._phase("vae_decode", lambda: self._decode_phase(outputs, sampling)) or []
 
     def _refine_conditions(self, prepared, sampling):
         """Encode high-resolution FL2VA anchors before either large model loads."""
@@ -565,12 +702,12 @@ class PhasedH3Engine:
         from .request_mode import run_requests
 
         self._mark("request_mode", encoder_dit_overlap=False)
-        media = self._phase(
-            "vae_encode", lambda: self._leader(lambda: self._encode_media(prepared))
-        )
+        media = self._phase("vae_encode", lambda: self._media_phase(prepared))
         refine = self._phase(
             "vae_encode_refine",
-            lambda: self._leader(lambda: self._refine_conditions(prepared, sampling)),
+            lambda: self._map_codec(
+                "media_encoder", prepared, lambda items: self._refine_conditions(items, sampling)
+            ),
         )
         if prepared is not None:
             prepared.clear()
@@ -616,21 +753,30 @@ class PhasedH3Engine:
                 runtime = loader = None
                 gc.collect()
                 torch.cuda.empty_cache()
-        return (
-            self._phase("vae_decode", lambda: self._leader(lambda: self._decode(outputs, sampling)))
-            or []
-        )
+        return self._phase("vae_decode", lambda: self._decode_phase(outputs, sampling)) or []
 
-    def _decode(self, outputs, sampling):
-        if not any(item.error is None for item in outputs):
-            return outputs
+    def _load_decoder(self):
+        from copy import copy
+
+        from vllm_omni.diffusion.data import DiffusionParallelConfig
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder import (
             MiniMaxH3DecoderPipeline,
         )
+
+        decoder_config = copy(self.worker.od_config)
+        decoder_config.parallel_config = DiffusionParallelConfig()
+        decoder = MiniMaxH3DecoderPipeline(od_config=decoder_config)
+        decoder._is_output_owner_rank = lambda: True
+        return decoder
+
+    def _decode(self, outputs, sampling, *, decoder=None):
+        if not any(item.error is None for item in outputs):
+            return outputs
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-        decoder = MiniMaxH3DecoderPipeline(od_config=self.worker.od_config)
+        if decoder is None:
+            decoder = self._load_decoder()
         try:
             for item in outputs:
                 if item.error is not None:
@@ -657,6 +803,50 @@ class PhasedH3Engine:
         finally:
             del decoder
 
+    def _rolling_decode(self, operation, sampling):
+        from .decoder_handoff import DecoderHandoff
+        from .phase_completion import PhaseCompletion
+
+        handoff = DecoderHandoff(self.phase_parallel.decoder.ranks, on_event=self._mark)
+        service_error = None
+        completion = None
+        try:
+            completion = PhaseCompletion()
+            try:
+                operation(handoff.publish)
+            except Exception as exc:
+                service_error = f"rank {self.rank}: {type(exc).__name__}: {exc}"
+            finally:
+                handoff.finish()
+            # operation returns only after local STOP, CUDA work, channels and
+            # all Python model owners have drained. There is no world barrier.
+            torch.cuda.synchronize(self.worker.device)
+            gc.collect()
+            torch.cuda.empty_cache()
+            self._mark("dit_local_released", allocated_bytes=torch.cuda.memory_allocated())
+            handoff.work(
+                self._load_decoder,
+                lambda decoder, value: self._decode([value], sampling, decoder=decoder)[0],
+                service_error=service_error,
+            )
+            outputs = handoff.collect()
+            local_error = "; ".join(([service_error] if service_error else []) + handoff.errors)
+            errors = completion.finish(local_error)
+            if any(errors):
+                raise RuntimeError(
+                    "Rolling stage handoff failed: " + "; ".join(e for e in errors if e)
+                )
+            # Request IDs are original numeric input positions in this finite API.
+            if self.is_ingress:
+                outputs.sort(key=lambda value: int(value.request_id))
+            return outputs
+        finally:
+            try:
+                if completion is not None:
+                    completion.close()
+            finally:
+                handoff.close()
+
     def generate(self, prompts, sampling_params):
         if self.closed or self.running:
             raise RuntimeError("Phased engine must be open and idle")
@@ -665,6 +855,7 @@ class PhasedH3Engine:
         self.timeline_events = []
         try:
             self._make_worker()
+            self._mark("phase_parallel", configuration=asdict(self.phase_parallel))
             # H3Runtime's context only needs the worker; no DiT is constructed here.
             with H3Runtime.context(self):
                 job = self._leader(lambda: self._prepare(list(prompts), sampling_params))
@@ -677,6 +868,13 @@ class PhasedH3Engine:
                     return self._generate_request_mode(
                         prepared, inputs, tags, header[0], sampling_params
                     )
+                if self.overlap_encoder_dit and self.overlap_dit_decoder:
+                    return self._rolling_decode(
+                        lambda publish: self._generate_overlap(
+                            prepared, inputs, tags, header[0], sampling_params, on_output=publish
+                        ),
+                        sampling_params,
+                    )
                 if self.overlap_encoder_dit:
                     return self._generate_overlap(
                         prepared, inputs, tags, header[0], sampling_params
@@ -684,9 +882,17 @@ class PhasedH3Engine:
                 hidden = self._phase("qwen_pp", lambda: self._encode_text(inputs, header[0]))
                 encoded = self._phase(
                     "vae_encode",
-                    lambda: self._leader(lambda: self._encode_media(prepared, hidden, tags)),
+                    lambda: self._media_phase(prepared, hidden, tags),
                 )
                 job = prepared = inputs = tags = hidden = None
+                if self.overlap_dit_decoder:
+                    return self._rolling_decode(
+                        lambda publish: self._phase(
+                            "dit",
+                            lambda: self._denoise(encoded, sampling_params, on_output=publish),
+                        ),
+                        sampling_params,
+                    )
                 outputs = self._phase(
                     "dit", lambda: self._finish_dit(lambda: self._denoise(encoded, sampling_params))
                 )
@@ -694,12 +900,15 @@ class PhasedH3Engine:
                 return (
                     self._phase(
                         "vae_decode",
-                        lambda: self._leader(lambda: self._decode(outputs, sampling_params)),
+                        lambda: self._decode_phase(outputs, sampling_params),
                     )
                     or []
                 )
         finally:
             self.running = False
+            for group in reversed(self._encoder_groups):
+                dist.destroy_process_group(group)
+            self._encoder_groups.clear()
             if self.worker is not None:
                 self.worker.shutdown()
                 self.worker = None
@@ -727,9 +936,16 @@ def create_phased_engine(
     encoder_stage_layers=None,
     trust_remote_code=False,
     overlap_encoder_dit=False,
+    overlap_dit_decoder=False,
     additional_config=None,
+    phase_parallel=None,
 ):
     """Construct a lazy finite-job engine for a local native H3 partition."""
+    phase_parallel = PhaseParallelConfig.resolve(
+        pp_size, phase_parallel, encoder_stage_layers=encoder_stage_layers, topology=topology
+    )
+    if overlap_encoder_dit:
+        phase_parallel.validate_overlap()
     validate_runtime(pp_size)
     if int(os.environ.get("WORLD_SIZE", "1")) != pp_size:
         raise ValueError("Launch one torchrun process per pipeline stage")
@@ -752,5 +968,7 @@ def create_phased_engine(
         encoder_stage_layers=encoder_stage_layers,
         trust_remote_code=trust_remote_code,
         overlap_encoder_dit=overlap_encoder_dit,
+        overlap_dit_decoder=overlap_dit_decoder,
         additional_config=additional_config,
+        phase_parallel=phase_parallel,
     )

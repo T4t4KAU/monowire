@@ -150,7 +150,7 @@ The default configuration retains the existing count-based behavior.
 `--phased` runs the entire finite job as Qwen-VL layer PP → VAE encoding →
 DiT PP → VAE decoding. Conditions and generated latents are retained in CPU RAM;
 model weights are released at phase boundaries. Qwen weights are partitioned by
-layer, with vision, embeddings and the first three DeepStack injections on rank 0.
+layer, with vision, embeddings and the first three DeepStack injections on the first encoder rank.
 The encoder preserves H3's unnormalized layer-50 output and multimodal positions.
 There is no encoder TP in this mode.
 
@@ -163,6 +163,96 @@ torchrun --standalone --nproc-per-node=8 -m monowire.cli \
   --batch-size 16 --microbatch-size 1 --downstream-batch-size 1 --trust-remote-code \
   --output outputs/phased.pt
 ```
+
+Each phase can select its own parallel strategy with `--phase-parallel-config`
+(JSON), or `create_phased_engine(..., phase_parallel=...)` in Python. The Python
+argument accepts the same dictionary or `PhaseParallelConfig` / `StageParallelConfig`
+from `monowire.models.h3.phase_parallel`.
+
+```bash
+# Add to an eight-worker --phased invocation:
+--phase-parallel-config '{
+  "encoder": {"mode": "pp", "ranks": [0, 1, 2, 3], "stage_layers": [13, 13, 12, 12]},
+  "media_encoder": {"mode": "dp", "ranks": [0, 4]},
+  "denoiser": {"mode": "pp", "ranks": [0, 1, 2, 3, 4, 5, 6, 7],
+               "stage_layers": [6, 7, 7, 6, 6, 6, 6, 6]},
+  "decoder": {"mode": "dp", "ranks": "all"}
+}'
+```
+
+| Phase | Implemented strategies | Placement |
+| --- | --- | --- |
+| `encoder` (Qwen) | `single`, layer `pp`, request `dp` | Independent subset of worker ranks |
+| `media_encoder` (video/audio VAE, including refinement anchors) | `single`, request `dp` | Independent subset |
+| `denoiser` (DiT) | `pp`; `single` with one worker | All launched workers in this backend |
+| `decoder` (video/audio VAE) | `single`, request `dp` | Independent subset |
+
+For all-card decoding, use
+`--phase-parallel-config '{"decoder":{"mode":"dp","ranks":"all"}}'`.
+`"all"` expands to every launched worker (for example, ranks 0–7 with eight workers).
+Each GPU decodes complete requests independently after DiT weights are released.
+In barrier-separated execution, only ranks assigned requests load the decoder.
+With rolling handoff, every configured replica loads before requesting work;
+some replicas may finish loading after all requests have been claimed.
+The existing single-rank default remains available when no decoder setting is supplied.
+
+`ranks` are increasing, unique **global torchrun ranks**, not physical GPU IDs.
+PP divides model layers; DP assigns whole requests round-robin to replicas, each
+of which must fit the complete phase model. DP does not pack requests or estimate
+compute cost from request counts. CPU handoffs restore original request order;
+only global rank 0 returns final outputs. Idle replicas do not load codecs or Qwen.
+Qwen vision/embeddings/DeepStack live on the first *encoder* rank, which need not
+be global rank 0. This CPU object transport is intended for finite phased jobs,
+not a zero-copy or streaming cross-stage transport.
+
+Without this option, behavior remains Qwen PP and DiT PP on all workers, with
+VAE encoding/decoding on rank 0. `--pp` remains the worker count / DiT PP degree.
+Omitted phase entries retain these defaults. Legacy `--encoder-stage-layers` and
+`--stage-layers` remain supported; conflicting new/legacy partitions are rejected.
+Each PP partition must cover the 50 retained layers. Unimplemented TP/SP, codec
+PP, DiT DP and DiT subsets are rejected rather than silently ignored.
+
+Independent placement uses barriers between phases; it does not enable concurrent
+execution by itself. Request DP and encoder PP subgroups use heartbeat-protected
+completion agreement so idle workers do not enter result collectives while peers
+are still loading or computing. `--overlap-encoder-dit` requires Qwen **PP with more than one
+rank**, and the current rolling handoff additionally requires exactly the same
+ordered rank set as DiT. Encoder and DiT layer partitions may still differ.
+
+To enable both rolling phase boundaries with all-card decoder DP, add:
+
+```bash
+--overlap-stages --phase-parallel-config '{"decoder":{"mode":"dp","ranks":"all"}}'
+```
+
+Python uses `overlap_encoder_dit=True, overlap_dit_decoder=True`. The individual
+CLI flags `--overlap-encoder-dit` and `--overlap-dit-decoder` can be enabled separately.
+They are opt-in; existing invocations retain barrier-separated execution.
+
+For the decoder handoff, each rank must first finish its DiT STOP protocol, drain
+CUDA work and communication, and release all local DiT owners. It then loads its
+VAE without a world barrier. Independent CPU/Gloo broker threads queue completed
+request latents; a replica advertises readiness **after loading**, then takes the
+next available request. Slow-loading replicas do not reserve work. Replies are
+restored to original input order on rank 0. Dedicated completion links include
+every worker, including non-decoder ranks and replicas with no requests. Early
+finishers exchange heartbeats until all local work ends; the final notification
+carries the agreed errors without an early world collective. Dedicated
+heartbeats also keep decoder links alive during loading, idle waits and long decoding.
+Model loading and decoding stay on each rank's main GPU-owning thread.
+
+Timeline events include `dit_local_released`, `decoder_load_start`,
+`decoder_load_end`, `decoder_replica_ready`, `decode_start` and `decode_end`.
+With decoder overlap enabled, ingress seals forward dispatch after the request
+source closes, pending admissions and prepared queues empty, and all outstanding
+steps are known to be final. FIFO STOP then lets suffix ranks drain and retire
+in order while ingress still receives and commits final results. An early rank
+can load its decoder and process completed requests while later DiT ranks compute.
+Available overlap depends on the remaining tail work and decoder loading time;
+a temporarily empty queue never authorizes retirement of a recurrent stage.
+The `dit_forward_sealed` event records this decision in the combined overlap path.
+Native multi-pass refinement/upscaling/continuation still requires the phased
+baseline and rejects `overlap_dit_decoder` explicitly.
 
 The phased engine accepts a local native `FL2VA` or `Ref2VA` partition directory
 and one DiT ingress. It supports the original dense model with Euler sampling.

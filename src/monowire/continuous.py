@@ -109,9 +109,17 @@ class ContinuousScheduler:
     """
 
     def __init__(
-        self, adapter: RequestAdapter, executor: BatchExecutor, config=None, on_event=None
+        self,
+        adapter: RequestAdapter,
+        executor: BatchExecutor,
+        config=None,
+        on_event=None,
+        *,
+        retire_on_final_dispatch=False,
     ):
         self.adapter, self.executor = adapter, executor
+        self.retire_on_final_dispatch = retire_on_final_dispatch
+        self.forward_sealed = False
         self.config = config or ContinuousConfig()
         self.on_event = on_event or (lambda event: None)
         self.pending = OrderedDict()  # Submitted requests awaiting an active slot.
@@ -462,6 +470,25 @@ class ContinuousScheduler:
             for bucket in self.ready.values()
         )
 
+    async def _seal_final_dispatch(self):
+        if not self.retire_on_final_dispatch or self.forward_sealed or not self.closing:
+            return
+        # Source exhaustion alone is insufficient: pending admissions and every
+        # earlier-step feedback may still create more forward work.
+        if self.pending or self.ingress or self.ready:
+            return
+        if any(phase == "admit" for _, phase in self.io_tasks.values()):
+            return
+        is_final = getattr(self.adapter, "is_final_step", None)
+        seal = getattr(self.executor, "seal", None)
+        if is_final is None or seal is None:
+            return
+        if any(not is_final(request.state, prepared) for request, prepared in self.tasks.values()):
+            return
+        await seal()
+        self.forward_sealed = True
+        self._event("forward_sealed")
+
     async def _run(self):
         try:
             while not self.closing or self._has_work():
@@ -474,6 +501,7 @@ class ContinuousScheduler:
                 self._dispatch()
                 self._prepare_batch()
                 self._dispatch()
+                await self._seal_final_dispatch()
                 if self.closing and not self._has_work():
                     break
                 if (

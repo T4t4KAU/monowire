@@ -30,8 +30,9 @@ class ContinuousEngine:
     All ranks must enter stream/generate and close in the same service lifecycle.
     """
 
-    def __init__(self, runtime: ModelRuntime, config):
+    def __init__(self, runtime: ModelRuntime, config, *, retire_on_final_dispatch=False):
         self.runtime, self.config = runtime, config
+        self.retire_on_final_dispatch = retire_on_final_dispatch
         self.rank = runtime.rank
         self.ingress_replicas = runtime.ingress_replicas
         self.running = False
@@ -66,7 +67,11 @@ class ContinuousEngine:
             executor = self.runtime.create_executor()
             cleanup.push_async_callback(executor.close)
             scheduler = ContinuousScheduler(
-                adapter, executor, self.config, on_event=self._record_event
+                adapter,
+                executor,
+                self.config,
+                on_event=self._record_event,
+                retire_on_final_dispatch=self.retire_on_final_dispatch,
             )
             intake_cleanup = await cleanup.enter_async_context(AsyncExitStack())
             intake_cleanup.push_async_callback(scheduler.close)

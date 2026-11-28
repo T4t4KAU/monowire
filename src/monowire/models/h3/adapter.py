@@ -221,6 +221,11 @@ class H3RequestAdapter:
                 [self._prepare_step(item.payload) for item in prepared]
             )
 
+    def is_final_step(self, state, prepared):
+        from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as native
+
+        return prepared.step == len(state.extra[native._STEP_SIGMAS_VIDEO]) - 2
+
     def finished(self, state):
         return state.denoise_completed
 

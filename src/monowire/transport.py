@@ -47,6 +47,8 @@ class PipelineExecutor:
         self.failure = None
         self.failure_signal = None
         self.closed = False
+        self.sealed = False
+        self._seal_task = None
 
     def start(self, *, on_capacity=None):
         """Keep the return/control channel live for the entire service lifetime."""
@@ -71,8 +73,8 @@ class PipelineExecutor:
     def _check_open(self):
         if self.failure is not None:
             raise self.failure
-        if self.closed:
-            raise RuntimeError("Pipeline executor is closed")
+        if self.closed or self.sealed:
+            raise RuntimeError("Pipeline executor is closed for submission")
 
     def _fail(self, error):
         if self.failure is None:
@@ -123,7 +125,7 @@ class PipelineExecutor:
                     assert feedback.get_nowait() is received
                 message = received.on_current_stream()
                 if message.get("stop"):
-                    if not self.closed or self.waiting:
+                    if not (self.closed or self.sealed) or self.waiting:
                         self._fail(RuntimeError("Suffix stopped before ingress closed and drained"))
                 else:
                     if SLOT_KEY in message:
@@ -232,6 +234,20 @@ class PipelineExecutor:
             self._fail(error)
         return futures
 
+    async def seal(self):
+        """End forward submissions while final-step feedback remains in flight.
+
+        The scheduler must prove no request can dispatch another step. FIFO STOP
+        follows every published packet; suffix ranks can retire in order while
+        ingress keeps its receiver and request state alive for final commits.
+        """
+        if self._seal_task is None:
+            self.sealed = True
+            if self.sender is not None:
+                self._seal_task = asyncio.create_task(asyncio.to_thread(self.sender.close))
+        if self._seal_task is not None:
+            await asyncio.shield(self._seal_task)
+
     async def close(self):
         if self.closed:
             return
@@ -244,7 +260,7 @@ class PipelineExecutor:
             return
         # The sender owns every published packet and drains it before STOP.
         try:
-            await asyncio.to_thread(self.sender.close)
+            await self.seal()
         finally:
             await self.receiver
         if self.failure is not None:

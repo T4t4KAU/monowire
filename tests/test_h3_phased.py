@@ -100,6 +100,23 @@ def rolling_encoder_worker(rank, store, count, drained, first_received, tail_loa
 
 
 class PhaseTests(unittest.TestCase):
+    def test_overlap_requires_multi_stage_qwen_pipeline(self):
+        options = dict(
+            config=SimpleNamespace(),
+            cache=None,
+            topology=None,
+            encoder_stage_layers=None,
+            trust_remote_code=False,
+        )
+        with self.assertRaisesRegex(ValueError, "requires Qwen pipeline parallelism"):
+            PhasedH3Engine("FL2VA", pp_size=1, overlap_encoder_dit=True, **options)
+        self.assertFalse(PhasedH3Engine("FL2VA", pp_size=1, **options).overlap_encoder_dit)
+        self.assertTrue(
+            PhasedH3Engine(
+                "FL2VA", pp_size=2, overlap_encoder_dit=True, **options
+            ).overlap_encoder_dit
+        )
+
     def test_decode_skips_model_loading_when_no_successful_outputs(self):
         engine = object.__new__(PhasedH3Engine)
         for outputs in ([], [SimpleNamespace(error="admission failed")]):
@@ -111,7 +128,7 @@ class PhaseTests(unittest.TestCase):
     def test_overlap_releases_spent_inputs_before_loading_next_model(self):
         engine = PhasedH3Engine(
             "FL2VA",
-            pp_size=1,
+            pp_size=2,
             config=SimpleNamespace(async_transport=True),
             cache=None,
             topology=None,
@@ -142,7 +159,7 @@ class PhaseTests(unittest.TestCase):
                 pass
 
         class Continuous:
-            def __init__(self, *args):
+            def __init__(self, *args, **kwargs):
                 pass
 
             async def stream(self, source):
@@ -160,12 +177,20 @@ class PhaseTests(unittest.TestCase):
             on_output(0, torch.ones((1, 5120)))
 
         engine._phase = lambda name, operation, **kwargs: operation()
+        engine._finish_dit = lambda operation: operation()
         engine._leader = lambda operation: operation()
         engine._encode_media = lambda values: ["encoded media"]
         engine._encode_text = encode_text
         engine._conditioning_payload = lambda hidden, tag, media: (hidden, tag, media)
         engine._decode = lambda outputs, sampling: outputs
+        # Exercise the multi-rank publish branch without real peer processes.
+        inbox = EncoderInbox([1], 5120, 0, None)
         with (
+            patch("monowire.models.h3.rolling.EncoderInbox", return_value=inbox),
+            patch(
+                "monowire.models.h3.phased.dist.send",
+                side_effect=lambda tensor, **kwargs: inbox.publish(0, tensor),
+            ),
             patch.dict(
                 sys.modules,
                 {

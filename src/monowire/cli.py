@@ -27,14 +27,28 @@ def main():
         choices=("t2va", "fl2va", "ref2va"),
         help="Defaults to ref2va for Ref2VA, otherwise fl2va with images or t2va",
     )
-    parser.add_argument("--pp", type=int, default=8)
+    parser.add_argument("--pp", type=int, default=8, help="Worker count (DiT PP degree)")
+    parser.add_argument(
+        "--phase-parallel-config",
+        help="Phased JSON: encoder, denoiser, decoder, media_encoder; each has mode/ranks/stage_layers",
+    )
     parser.add_argument(
         "--phased", action="store_true", help="Finite job: Qwen PP, VAE encode, DiT PP, VAE decode"
     )
     parser.add_argument(
         "--overlap-encoder-dit",
         action="store_true",
-        help="With --phased, switch each drained Qwen stage to DiT independently",
+        help="With --phased and matching multi-rank encoder/DiT PP, switch drained ranks independently",
+    )
+    parser.add_argument(
+        "--overlap-dit-decoder",
+        action="store_true",
+        help="With --phased, load each decoder after its local DiT service drains",
+    )
+    parser.add_argument(
+        "--overlap-stages",
+        action="store_true",
+        help="Enable both rolling Qwen/DiT and DiT/decoder handoffs",
     )
     parser.add_argument(
         "--encoder-stage-layers",
@@ -87,20 +101,38 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
+    args.overlap_encoder_dit |= args.overlap_stages
+    args.overlap_dit_decoder |= args.overlap_stages
+    if args.overlap_dit_decoder and not args.phased:
+        parser.error("--overlap-dit-decoder requires --phased")
     if args.pp < 1:
         parser.error("--pp must be positive")
     if args.overlap_encoder_dit and not args.phased:
         parser.error("--overlap-encoder-dit requires --phased")
+
     if args.encoder_stage_layers and not args.phased:
         parser.error("--encoder-stage-layers requires --phased")
     if args.phased and args.ingress_replicas != 1:
         parser.error("--phased currently requires --ingress-replicas 1")
+    if args.phase_parallel_config is not None and not args.phased:
+        parser.error("--phase-parallel-config requires --phased")
+    phase_parallel = None
     if args.phased:
-        from .models.h3.phase_utils import encoder_partition
+        from .models.h3.phase_parallel import PhaseParallelConfig
+        from .topology import PipelineTopology
 
         try:
-            encoder_partition(args.pp, args.encoder_stage_layers)
-        except ValueError as error:
+            phase_parallel = PhaseParallelConfig.resolve(
+                args.pp,
+                json.loads(args.phase_parallel_config)
+                if args.phase_parallel_config is not None
+                else None,
+                encoder_stage_layers=args.encoder_stage_layers,
+                topology=PipelineTopology(tuple(args.stage_layers)) if args.stage_layers else None,
+            )
+            if args.overlap_encoder_dit:
+                phase_parallel.validate_overlap()
+        except (ValueError, TypeError) as error:
             parser.error(str(error))
     try:
         extra = json.loads(args.extra_args)
@@ -167,7 +199,9 @@ def main():
         factory = create_phased_engine
         options = {
             "encoder_stage_layers": args.encoder_stage_layers,
+            "phase_parallel": phase_parallel,
             "overlap_encoder_dit": args.overlap_encoder_dit,
+            "overlap_dit_decoder": args.overlap_dit_decoder,
             "additional_config": additional,
         }
     engine = factory(
